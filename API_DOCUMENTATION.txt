@@ -442,11 +442,15 @@ POST /api/posts
   - multipart/form-data (text + optional media upload)
 - Request JSON:
   {
-    "text": "Hello world"
+    "text": "Hello world",
+    "client_post_id": "optional-stable-idempotency-key"
   }
 - Request multipart fields:
   - text: required string
   - media / media[] / files / file: optional file(s), max 8 total
+  - client_post_id / idempotency_key: optional stable idempotency key for retry-safe background uploads
+- Optional headers:
+  - Idempotency-Key (or X-Idempotency-Key): stable key reused across retries of the same post upload
 - Request Field Rules:
   - text: required string
   - Empty or whitespace-only values are rejected.
@@ -456,6 +460,7 @@ POST /api/posts
   - Supported video types: video/mp4, video/quicktime
   - Videos must be 30 minutes (1800s) or shorter.
   - If MinIO/object-storage is unavailable and `MEDIA_LOCAL_FALLBACK_ENABLED=true`, media is stored under `/static/uploads/posts/...`.
+  - If an idempotency key is supplied, retries with the same key return the original `post_id` instead of creating duplicates.
 - Success: 201
   {
     "message": "Post created successfully",

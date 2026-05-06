@@ -505,6 +505,49 @@ def _ensure_message_user_delete_schema():
     db.session.commit()
 
 
+def _ensure_message_reactions_schema():
+    db.session.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS message_reactions ("
+            "id INTEGER PRIMARY KEY, "
+            "message_id VARCHAR(64) NOT NULL, "
+            "message_scope VARCHAR(16) NOT NULL, "
+            "group_id INTEGER, "
+            "chat_counterpart VARCHAR(80), "
+            "username VARCHAR(80) NOT NULL, "
+            "emoji VARCHAR(32) NOT NULL, "
+            "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        )
+    )
+    db.session.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_message_reaction_message_user "
+            "ON message_reactions (message_id, username)"
+        )
+    )
+    db.session.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_message_reactions_scope_lookup "
+            "ON message_reactions (message_scope, group_id, chat_counterpart, message_id)"
+        )
+    )
+    db.session.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_message_reactions_message_id "
+            "ON message_reactions (message_id)"
+        )
+    )
+    db.session.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_message_reactions_username "
+            "ON message_reactions (username)"
+        )
+    )
+    db.session.commit()
+
+
 def _ensure_crash_log_schema():
     inspector = inspect(db.engine)
     if not inspector.has_table("crash_logs"):
@@ -619,6 +662,109 @@ def _ensure_user_badge_schema():
         )
     )
     db.session.commit()
+
+
+def _ensure_user_referral_schema():
+    inspector = inspect(db.engine)
+    if not inspector.has_table("users"):
+        return
+
+    column_names = {
+        column["name"]
+        for column in inspector.get_columns("users")
+    }
+    if "referral_code" not in column_names:
+        db.session.execute(
+            text(
+                "ALTER TABLE users "
+                "ADD COLUMN referral_code VARCHAR(16)"
+            )
+        )
+    if "referred_by_user_id" not in column_names:
+        db.session.execute(
+            text(
+                "ALTER TABLE users "
+                "ADD COLUMN referred_by_user_id INTEGER"
+            )
+        )
+
+    db.session.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_referral_code "
+            "ON users (referral_code)"
+        )
+    )
+    db.session.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_users_referred_by_user_id "
+            "ON users (referred_by_user_id)"
+        )
+    )
+    db.session.commit()
+
+
+def _ensure_pending_registration_referral_schema():
+    inspector = inspect(db.engine)
+    if not inspector.has_table("pending_registrations"):
+        return
+
+    column_names = {
+        column["name"]
+        for column in inspector.get_columns("pending_registrations")
+    }
+    if "referral_code" not in column_names:
+        db.session.execute(
+            text(
+                "ALTER TABLE pending_registrations "
+                "ADD COLUMN referral_code VARCHAR(16)"
+            )
+        )
+        db.session.commit()
+
+
+def _ensure_user_device_id_schema():
+    inspector = inspect(db.engine)
+    if not inspector.has_table("users"):
+        return
+
+    column_names = {
+        column["name"]
+        for column in inspector.get_columns("users")
+    }
+    if "device_id" not in column_names:
+        db.session.execute(
+            text(
+                "ALTER TABLE users "
+                "ADD COLUMN device_id VARCHAR(128)"
+            )
+        )
+
+    db.session.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_users_device_id "
+            "ON users (device_id)"
+        )
+    )
+    db.session.commit()
+
+
+def _ensure_pending_registration_device_id_schema():
+    inspector = inspect(db.engine)
+    if not inspector.has_table("pending_registrations"):
+        return
+
+    column_names = {
+        column["name"]
+        for column in inspector.get_columns("pending_registrations")
+    }
+    if "device_id" not in column_names:
+        db.session.execute(
+            text(
+                "ALTER TABLE pending_registrations "
+                "ADD COLUMN device_id VARCHAR(128)"
+            )
+        )
+        db.session.commit()
 
 
 def _warn_on_database_fallback(app: Flask):
@@ -912,9 +1058,16 @@ def create_app():
         _ensure_group_recipient_seen_schema()
         _ensure_group_key_fanout_schema()
         _ensure_message_user_delete_schema()
+        _ensure_message_reactions_schema()
         _ensure_crash_log_schema()
         _ensure_user_created_at_schema()
         _ensure_user_badge_schema()
+        _ensure_user_referral_schema()
+        _ensure_pending_registration_referral_schema()
+        _ensure_user_device_id_schema()
+        _ensure_pending_registration_device_id_schema()
+        from app.services import auth_service
+        auth_service.ensure_user_referral_codes()
         migrated_passwords = password_security.migrate_plaintext_passwords()
         if migrated_passwords:
             app.logger.info(

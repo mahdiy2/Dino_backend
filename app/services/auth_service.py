@@ -23,6 +23,10 @@ USERNAME_ALLOWED_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 _LETTER_PATTERN = re.compile(r"[A-Za-z]")
 _DIGIT_PATTERN = re.compile(r"\d")
 _SYMBOL_PATTERN = re.compile(r"[^A-Za-z0-9]")
+REFERRAL_CODE_ALLOWED_PATTERN = re.compile(r"^[A-Za-z0-9]{6,16}$")
+REFERRAL_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+REFERRAL_CODE_DEFAULT_LENGTH = 8
+DEVICE_ID_ALLOWED_PATTERN = re.compile(r"^[A-Za-z0-9._-]{6,128}$")
 
 
 class AuthError(ValueError):
@@ -278,6 +282,115 @@ def hash_password_for_storage(password: str) -> str:
     return password_security.hash_password(validated_password)
 
 
+def _normalize_referral_code(referral_code):
+    if referral_code is None:
+        return None
+    if not isinstance(referral_code, str):
+        raise AuthError("Referral code must be a string", status_code=400)
+
+    normalized = referral_code.strip().upper()
+    if not normalized:
+        return None
+    if not REFERRAL_CODE_ALLOWED_PATTERN.fullmatch(normalized):
+        raise AuthError(
+            "Referral code must contain 6 to 16 English letters or numbers",
+            status_code=400,
+        )
+    return normalized
+
+
+def _normalize_device_id(device_id):
+    if device_id is None:
+        return None
+    if not isinstance(device_id, str):
+        raise AuthError("device_id must be a string", status_code=400)
+
+    normalized = device_id.strip()
+    if not normalized:
+        return None
+    if len(normalized) > 128:
+        raise AuthError("device_id is too long", status_code=400)
+    if not DEVICE_ID_ALLOWED_PATTERN.fullmatch(normalized):
+        raise AuthError("device_id has invalid format", status_code=400)
+    return normalized
+
+
+def _generate_unique_referral_code(reserved_codes: set[str] | None = None) -> str:
+    reserved = reserved_codes or set()
+
+    for _ in range(40):
+        candidate = "".join(
+            secrets.choice(REFERRAL_CODE_ALPHABET)
+            for _ in range(REFERRAL_CODE_DEFAULT_LENGTH)
+        )
+        if candidate in reserved:
+            continue
+        if not user_repository.get_by_referral_code(candidate):
+            return candidate
+
+    for length in range(9, 17):
+        for _ in range(20):
+            candidate = "".join(
+                secrets.choice(REFERRAL_CODE_ALPHABET)
+                for _ in range(length)
+            )
+            if candidate in reserved:
+                continue
+            if not user_repository.get_by_referral_code(candidate):
+                return candidate
+
+    raise AuthError("Could not generate referral code", status_code=500)
+
+
+def _resolve_referrer_id_for_new_user(
+    username: str,
+    referral_code: str | None,
+) -> tuple[str | None, int | None]:
+    normalized_referral_code = _normalize_referral_code(referral_code)
+    if not normalized_referral_code:
+        return None, None
+
+    referrer = user_repository.get_by_referral_code(normalized_referral_code)
+    if not referrer:
+        raise AuthError("Referral code is invalid", status_code=400)
+    if referrer.username.strip().lower() == username.strip().lower():
+        raise AuthError("You cannot use your own referral code", status_code=400)
+
+    return normalized_referral_code, int(referrer.id)
+
+
+def ensure_user_referral_codes() -> int:
+    from app.models.user_model import User
+
+    users = User.query.order_by(User.id.asc()).all()
+    reserved_codes: set[str] = set()
+    updated_count = 0
+
+    for user in users:
+        normalized = (user.referral_code or "").strip().upper()
+        is_valid = bool(
+            normalized
+            and REFERRAL_CODE_ALLOWED_PATTERN.fullmatch(normalized)
+            and normalized not in reserved_codes
+        )
+
+        if is_valid:
+            if user.referral_code != normalized:
+                user.referral_code = normalized
+                updated_count += 1
+            reserved_codes.add(normalized)
+            continue
+
+        generated = _generate_unique_referral_code(reserved_codes=reserved_codes)
+        user.referral_code = generated
+        reserved_codes.add(generated)
+        updated_count += 1
+
+    if updated_count:
+        db.session.commit()
+    return updated_count
+
+
 def _normalize_register_fields(username, password, public_key, name):
     if (
         not _require_non_empty_string(username)
@@ -306,7 +419,14 @@ def _normalize_register_fields(username, password, public_key, name):
     return username, validated_password, public_key, resolved_name
 
 
-def register(username, password, public_key, name=None):
+def register(
+    username,
+    password,
+    public_key,
+    name=None,
+    referral_code=None,
+    device_id=None,
+):
     username, password, public_key, resolved_name = _normalize_register_fields(
         username,
         password,
@@ -318,16 +438,33 @@ def register(username, password, public_key, name=None):
         # Keep legacy behavior for old clients that expect 400 from /register.
         raise AuthError("Username already exists", status_code=400)
 
+    normalized_device_id = _normalize_device_id(device_id)
+    normalized_referral_code, referred_by_user_id = _resolve_referrer_id_for_new_user(
+        username=username,
+        referral_code=referral_code,
+    )
+
     password_hash = password_security.hash_password(password)
     user_repository.create_user(
         username=username,
         password_hash=password_hash,
         public_key=public_key,
         name=resolved_name,
+        referral_code=_generate_unique_referral_code(),
+        device_id=normalized_device_id,
+        referred_by_user_id=referred_by_user_id,
     )
 
 
-def start_registration(username, password, public_key, name=None, client_nonce=None):
+def start_registration(
+    username,
+    password,
+    public_key,
+    name=None,
+    client_nonce=None,
+    referral_code=None,
+    device_id=None,
+):
     username, password, public_key, resolved_name = _normalize_register_fields(
         username,
         password,
@@ -344,6 +481,12 @@ def start_registration(username, password, public_key, name=None, client_nonce=N
 
     if user_repository.get_by_username(username):
         raise AuthError("Username already exists", status_code=409)
+
+    normalized_device_id = _normalize_device_id(device_id)
+    normalized_referral_code, _ = _resolve_referrer_id_for_new_user(
+        username=username,
+        referral_code=referral_code,
+    )
 
     now = datetime.utcnow()
     expires_at = now + timedelta(seconds=PENDING_REGISTRATION_TTL_SECONDS)
@@ -370,6 +513,8 @@ def start_registration(username, password, public_key, name=None, client_nonce=N
             password_hash=password_hash,
             public_key=public_key,
             name=resolved_name,
+            referral_code=normalized_referral_code,
+            device_id=normalized_device_id,
             expires_at=expires_at,
             client_nonce=client_nonce,
         )
@@ -380,6 +525,8 @@ def start_registration(username, password, public_key, name=None, client_nonce=N
             password_hash=password_hash,
             public_key=public_key,
             name=resolved_name,
+            referral_code=normalized_referral_code,
+            device_id=normalized_device_id,
             expires_at=expires_at,
             client_nonce=client_nonce,
         )
@@ -409,12 +556,22 @@ def confirm_registration(registration_id):
         pending_registration_repository.delete_pending_registration(pending)
         raise AuthError("Username already exists", status_code=409)
 
+    referred_by_user_id = None
+    normalized_pending_referral_code = (pending.referral_code or "").strip().upper()
+    if normalized_pending_referral_code:
+        referrer = user_repository.get_by_referral_code(normalized_pending_referral_code)
+        if referrer and referrer.username.strip().lower() != pending.username.strip().lower():
+            referred_by_user_id = int(referrer.id)
+
     try:
         user_repository.create_user(
             username=pending.username,
             password_hash=pending.password_hash,
             public_key=pending.public_key,
             name=pending.name,
+            referral_code=_generate_unique_referral_code(),
+            device_id=_normalize_device_id(pending.device_id),
+            referred_by_user_id=referred_by_user_id,
             auto_commit=False,
         )
         pending_registration_repository.delete_pending_registration(pending, commit=False)
@@ -521,4 +678,28 @@ def get_key_status(username):
 
     return {
         "has_public_key": bool(getattr(user, "public_key", None)),
+    }
+
+
+def update_user_device_id(username, device_id):
+    if not _require_non_empty_string(username):
+        raise AuthError("Unauthorized", status_code=401)
+
+    normalized_username = username.strip()
+    normalized_device_id = _normalize_device_id(device_id)
+    if not normalized_device_id:
+        raise AuthError("device_id is required", status_code=400)
+
+    user = user_repository.get_by_username(normalized_username)
+    if not user:
+        raise AuthError("User not found", status_code=404)
+    if getattr(user, "is_suspended", False):
+        raise AuthError("Account suspended", status_code=403)
+
+    user_repository.update_device_id(
+        username=normalized_username,
+        device_id=normalized_device_id,
+    )
+    return {
+        "message": "Device ID updated",
     }

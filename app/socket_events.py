@@ -606,6 +606,19 @@ def _build_contacts_update_payload(
     return payload
 
 
+def _normalize_reaction_emoji(raw_emoji):
+    if raw_emoji is None:
+        return None
+    if not isinstance(raw_emoji, str):
+        return None
+    normalized = raw_emoji.strip()
+    if not normalized:
+        return None
+    if len(normalized) > 32:
+        return None
+    return normalized
+
+
 def _touch_recently_online(username, seen_at=None):
     normalized_username = _normalize_username(username)
     if not normalized_username:
@@ -1058,6 +1071,115 @@ def register_socket_events():
             "user_status",
             {"username": target_username, "online": is_user_online(target_username)},
         )
+
+    @socketio.on("react_to_message")
+    def handle_react_to_message(data):
+        username = session.get("username")
+        if not username:
+            emit("message_error", {"error": "Unauthorized"})
+            return
+
+        if not isinstance(data, dict):
+            emit("message_error", {"error": "Invalid payload"})
+            return
+
+        message_id = data.get("message_id")
+        if not isinstance(message_id, str) or not message_id.strip():
+            emit("message_error", {"error": "message_id is required"})
+            return
+        message_id = message_id.strip()
+        emoji = _normalize_reaction_emoji(data.get("emoji"))
+
+        context = message_service.get_message_scope_context(message_id)
+        if not isinstance(context, dict):
+            emit("message_error", {"error": "Message not found"})
+            return
+
+        scope = context.get("scope")
+        try:
+            if scope == "private":
+                sender = context.get("sender")
+                recipient = context.get("recipient")
+                if username != sender and username != recipient:
+                    emit("message_error", {"error": "You are not allowed to react to this message"})
+                    return
+                counterpart = recipient if username == sender else sender
+                if emoji is None:
+                    message_service.remove_message_reaction(message_id, username)
+                else:
+                    message_service.set_message_reaction(
+                        message_id=message_id,
+                        username=username,
+                        emoji=emoji,
+                        message_scope="private",
+                        chat_counterpart=counterpart,
+                    )
+                reactions = message_service.get_message_reactions(message_id)
+                sender_payload = {
+                    "scope": "private",
+                    "message_id": message_id,
+                    "chat_id": recipient,
+                    "reactions": reactions,
+                    "updated_by": username,
+                }
+                recipient_payload = {
+                    "scope": "private",
+                    "message_id": message_id,
+                    "chat_id": sender,
+                    "reactions": reactions,
+                    "updated_by": username,
+                }
+                socketio.emit("message_reaction_updated", sender_payload, room=sender)
+                socketio.emit("message_reaction_updated", recipient_payload, room=recipient)
+                emit(
+                    "message_reaction_applied",
+                    sender_payload if username == sender else recipient_payload,
+                )
+                return
+
+            if scope == "group":
+                group_id = context.get("group_id")
+                try:
+                    group_id = int(group_id)
+                except (TypeError, ValueError):
+                    emit("message_error", {"error": "Invalid group message context"})
+                    return
+
+                from app.repositories import group_repository, user_repository
+
+                user = user_repository.get_by_username(username)
+                if not user or not group_repository.is_member(group_id, user.id):
+                    emit("message_error", {"error": "You are not a member of this group"})
+                    return
+
+                if emoji is None:
+                    message_service.remove_message_reaction(message_id, username)
+                else:
+                    message_service.set_message_reaction(
+                        message_id=message_id,
+                        username=username,
+                        emoji=emoji,
+                        message_scope="group",
+                        group_id=group_id,
+                    )
+                reactions = message_service.get_message_reactions(message_id)
+                payload = {
+                    "scope": "group",
+                    "group_id": group_id,
+                    "message_id": message_id,
+                    "reactions": reactions,
+                    "updated_by": username,
+                }
+                emit_group_event_to_members(group_id, "message_reaction_updated", payload)
+                emit("message_reaction_applied", payload)
+                return
+
+            emit("message_error", {"error": "Unsupported message scope"})
+        except ValueError as exc:
+            emit("message_error", {"error": str(exc)})
+        except Exception as exc:
+            logger.error("react_to_message error: %s", exc, exc_info=True)
+            emit("message_error", {"error": "Failed to apply reaction"})
 
     @socketio.on("send_message")
     def handle_send_message(data):

@@ -37,9 +37,12 @@ VIDEO_MIME_TYPES_WITH_RELIABLE_DURATION = {
     "video/mp4",
     "video/quicktime",
 }
-POST_UPLOAD_LOCK_KEY_PREFIX = "post_upload:lock"
-POST_UPLOAD_LOCK_TTL_SECONDS = 300
 POST_UPLOAD_IN_PROGRESS_ERROR = "Another post upload is already in progress"
+POST_UPLOAD_IDEMPOTENCY_KEY_PREFIX = "post_upload:idempotency"
+POST_UPLOAD_IDEMPOTENCY_RESULT_TTL_SECONDS = 24 * 60 * 60
+POST_UPLOAD_IDEMPOTENCY_PROCESSING_TTL_SECONDS = 30 * 60
+POST_UPLOAD_IDEMPOTENCY_WAIT_SECONDS = 15.0
+POST_UPLOAD_IDEMPOTENCY_POLL_INTERVAL_SECONDS = 0.25
 
 
 class MediaStorageError(Exception):
@@ -436,36 +439,122 @@ def _guess_mimetype_from_filename(file_name: str | None) -> str:
     return _normalize_mimetype(guessed)
 
 
-def _build_upload_lock_key(username: str) -> str:
-    prefix = (current_app.config.get("POST_UPLOAD_LOCK_KEY_PREFIX") or "").strip()
+def _build_post_idempotency_key_prefix(username: str, idempotency_key: str) -> str:
+    prefix = (current_app.config.get("POST_UPLOAD_IDEMPOTENCY_KEY_PREFIX") or "").strip()
     if not prefix:
-        prefix = POST_UPLOAD_LOCK_KEY_PREFIX
-    return f"{prefix}:{username}"
+        prefix = POST_UPLOAD_IDEMPOTENCY_KEY_PREFIX
+    return f"{prefix}:{username}:{idempotency_key}"
 
 
-def _acquire_upload_lock(username: str):
+def _build_post_idempotency_result_key(username: str, idempotency_key: str) -> str:
+    return f"{_build_post_idempotency_key_prefix(username, idempotency_key)}:result"
+
+
+def _build_post_idempotency_processing_key(username: str, idempotency_key: str) -> str:
+    return f"{_build_post_idempotency_key_prefix(username, idempotency_key)}:processing"
+
+
+def _normalize_post_idempotency_key(idempotency_key: str | None) -> str | None:
+    if idempotency_key is None:
+        return None
+    if not isinstance(idempotency_key, str):
+        raise ValueError("idempotency_key must be a string")
+
+    normalized = idempotency_key.strip()
+    if not normalized:
+        return None
+    if len(normalized) > 128:
+        raise ValueError("idempotency_key must be at most 128 characters")
+
+    for ch in normalized:
+        if ord(ch) < 33 or ord(ch) > 126:
+            raise ValueError("idempotency_key contains unsupported characters")
+    return normalized
+
+
+def _read_idempotent_post_id(username: str, idempotency_key: str) -> int | None:
     redis_client = redis_backend.redis_client
-    key = _build_upload_lock_key(username)
-    token = uuid.uuid4().hex
-    ttl_seconds = max(
-        30,
-        int(current_app.config.get("POST_UPLOAD_LOCK_TTL_SECONDS", POST_UPLOAD_LOCK_TTL_SECONDS)),
-    )
+    key = _build_post_idempotency_result_key(username, idempotency_key)
     try:
-        acquired = bool(redis_client.set(key, token, nx=True, ex=ttl_seconds))
+        value = redis_client.get(key)
+    except Exception:
+        return None
+
+    if value in {None, ""}:
+        return None
+
+    try:
+        post_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    if post_id <= 0:
+        return None
+    return post_id
+
+
+def _acquire_post_idempotency_lock(username: str, idempotency_key: str):
+    redis_client = redis_backend.redis_client
+    processing_key = _build_post_idempotency_processing_key(username, idempotency_key)
+    token = uuid.uuid4().hex
+    processing_ttl_seconds = max(
+        60,
+        int(
+            current_app.config.get(
+                "POST_UPLOAD_IDEMPOTENCY_PROCESSING_TTL_SECONDS",
+                POST_UPLOAD_IDEMPOTENCY_PROCESSING_TTL_SECONDS,
+            )
+        ),
+    )
+    wait_seconds = max(
+        0.0,
+        float(
+            current_app.config.get(
+                "POST_UPLOAD_IDEMPOTENCY_WAIT_SECONDS",
+                POST_UPLOAD_IDEMPOTENCY_WAIT_SECONDS,
+            )
+        ),
+    )
+    poll_interval_seconds = max(
+        0.05,
+        float(
+            current_app.config.get(
+                "POST_UPLOAD_IDEMPOTENCY_POLL_INTERVAL_SECONDS",
+                POST_UPLOAD_IDEMPOTENCY_POLL_INTERVAL_SECONDS,
+            )
+        ),
+    )
+
+    try:
+        acquired = bool(
+            redis_client.set(
+                processing_key,
+                token,
+                nx=True,
+                ex=processing_ttl_seconds,
+            )
+        )
     except Exception:
         if has_app_context():
             current_app.logger.warning(
-                "post_upload_lock_unavailable username=%s",
+                "post_idempotency_lock_unavailable username=%s",
                 username,
             )
         return None
-    if not acquired:
-        raise ConcurrentPostUploadError(POST_UPLOAD_IN_PROGRESS_ERROR)
-    return key, token
+
+    if acquired:
+        return processing_key, token
+
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        replay_post_id = _read_idempotent_post_id(username, idempotency_key)
+        if replay_post_id is not None:
+            return replay_post_id
+        time.sleep(poll_interval_seconds)
+
+    raise ConcurrentPostUploadError(POST_UPLOAD_IN_PROGRESS_ERROR)
 
 
-def _release_upload_lock(lock_handle):
+def _release_lock(lock_handle, *, failure_log_label: str):
     if not lock_handle:
         return
     redis_client = redis_backend.redis_client
@@ -485,9 +574,37 @@ return 0
         except Exception:
             if has_app_context():
                 current_app.logger.warning(
-                    "post_upload_lock_release_failed key=%s",
+                    "%s key=%s",
+                    failure_log_label,
                     key,
                 )
+
+
+def _release_post_idempotency_lock(lock_handle):
+    _release_lock(lock_handle, failure_log_label="post_idempotency_lock_release_failed")
+
+
+def _store_idempotent_post_id(username: str, idempotency_key: str, post_id: int):
+    redis_client = redis_backend.redis_client
+    result_key = _build_post_idempotency_result_key(username, idempotency_key)
+    result_ttl_seconds = max(
+        300,
+        int(
+            current_app.config.get(
+                "POST_UPLOAD_IDEMPOTENCY_RESULT_TTL_SECONDS",
+                POST_UPLOAD_IDEMPOTENCY_RESULT_TTL_SECONDS,
+            )
+        ),
+    )
+    try:
+        redis_client.setex(result_key, result_ttl_seconds, str(int(post_id)))
+    except Exception:
+        if has_app_context():
+            current_app.logger.warning(
+                "post_idempotency_result_store_failed username=%s post_id=%s",
+                username,
+                post_id,
+            )
 
 
 def _is_blocked_media_mimetype(mimetype: str) -> bool:
@@ -718,8 +835,22 @@ def create_post_with_media(
     track_title: str | None = None,
     track_artist: str | None = None,
     quoted_post_id: int | None = None,
+    idempotency_key: str | None = None,
 ):
-    lock_handle = _acquire_upload_lock(username)
+    normalized_idempotency_key = _normalize_post_idempotency_key(idempotency_key)
+    idempotency_lock_handle = None
+    if normalized_idempotency_key:
+        replay_post_id = _read_idempotent_post_id(username, normalized_idempotency_key)
+        if replay_post_id is not None:
+            return {"post_id": replay_post_id}
+        acquired_idempotency_lock = _acquire_post_idempotency_lock(
+            username,
+            normalized_idempotency_key,
+        )
+        if isinstance(acquired_idempotency_lock, int):
+            return {"post_id": acquired_idempotency_lock}
+        idempotency_lock_handle = acquired_idempotency_lock
+
     try:
         files = files or []
         if len(files) > MAX_MEDIA_FILES:
@@ -885,6 +1016,8 @@ def create_post_with_media(
                 )
 
         db.session.commit()
+        if normalized_idempotency_key:
+            _store_idempotent_post_id(username, normalized_idempotency_key, post.id)
         if media_post_process_items:
             async_task_service.enqueue_media_post_process_task(
                 post_id=post.id,
@@ -893,7 +1026,7 @@ def create_post_with_media(
             )
         return {"post_id": post.id}
     finally:
-        _release_upload_lock(lock_handle)
+        _release_post_idempotency_lock(idempotency_lock_handle)
 
 
 def get_posts(

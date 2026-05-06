@@ -12,6 +12,8 @@ class PendingRegistration(db.Model):
     password_hash = db.Column(db.String(128), nullable=False)
     public_key = db.Column(db.Text, nullable=False)
     name = db.Column(db.String(120), nullable=False)
+    referral_code = db.Column(db.String(16), nullable=True)
+    device_id = db.Column(db.String(128), nullable=True)
     client_nonce = db.Column(db.String(64), nullable=True)
     expires_at = db.Column(db.DateTime, nullable=False, index=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)

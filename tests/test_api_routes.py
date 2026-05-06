@@ -132,6 +132,224 @@ class TestApiRoutes(unittest.TestCase):
         body = login_response.get_json()
         self.assertIn("access_token", body)
         self.assertIn("refresh_token", body)
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            user = User.query.filter_by(username="api_user").first()
+            self.assertIsNotNone(user)
+            self.assertTrue((user.referral_code or "").strip())
+
+    def test_auth_register_with_referral_code_links_referrer(self):
+        self._register("ref_owner")
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            ref_owner = User.query.filter_by(username="ref_owner").first()
+            self.assertIsNotNone(ref_owner)
+            referral_code = ref_owner.referral_code
+
+        register_response = self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "invited_user",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "referral_code": referral_code,
+            },
+        )
+        self.assertEqual(register_response.status_code, 201)
+
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            invited = User.query.filter_by(username="invited_user").first()
+            ref_owner = User.query.filter_by(username="ref_owner").first()
+            self.assertIsNotNone(invited)
+            self.assertIsNotNone(ref_owner)
+            self.assertEqual(invited.referred_by_user_id, ref_owner.id)
+
+    def test_auth_register_persists_device_id(self):
+        register_response = self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "device_user",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "device_id": "android-device-001",
+            },
+        )
+        self.assertEqual(register_response.status_code, 201)
+
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            user = User.query.filter_by(username="device_user").first()
+            self.assertIsNotNone(user)
+            self.assertEqual(user.device_id, "android-device-001")
+
+    def test_auth_register_rejects_invalid_referral_code(self):
+        register_response = self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "invited_user",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "referral_code": "INVALID01",
+            },
+        )
+        self.assertEqual(register_response.status_code, 400)
+        self.assertEqual(register_response.get_json()["error"], "Referral code is invalid")
+
+    def test_auth_register_start_accepts_referral_code(self):
+        self._register("ref_owner")
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            ref_owner = User.query.filter_by(username="ref_owner").first()
+            self.assertIsNotNone(ref_owner)
+            referral_code = ref_owner.referral_code
+
+        start_response = self.client.post(
+            "/api/auth/register/start",
+            json={
+                "username": "pending_invited",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "client_nonce": "nonce-1",
+                "referral_code": referral_code,
+            },
+        )
+        self.assertEqual(start_response.status_code, 202)
+        registration_id = start_response.get_json()["registration_id"]
+        self.assertTrue(registration_id)
+
+        confirm_response = self.client.post(
+            "/api/auth/register/confirm",
+            json={"registration_id": registration_id},
+        )
+        self.assertEqual(confirm_response.status_code, 201)
+
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            invited = User.query.filter_by(username="pending_invited").first()
+            ref_owner = User.query.filter_by(username="ref_owner").first()
+            self.assertIsNotNone(invited)
+            self.assertIsNotNone(ref_owner)
+            self.assertEqual(invited.referred_by_user_id, ref_owner.id)
+
+    def test_profile_referral_summary_endpoint(self):
+        self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "owner",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "device_id": "owner-device",
+            },
+        )
+        owner_headers = self._auth_header("owner")
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            owner = User.query.filter_by(username="owner").first()
+            self.assertIsNotNone(owner)
+            referral_code = owner.referral_code
+
+        self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "invitee_1",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "referral_code": referral_code,
+                "device_id": "invitee-device-1",
+            },
+        )
+        self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "invitee_2",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "referral_code": referral_code,
+                "device_id": "invitee-device-2",
+            },
+        )
+
+        response = self.client.get("/api/profiles/me/referral", headers=owner_headers)
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["referral_code"], referral_code)
+        self.assertEqual(payload["joined_count"], 2)
+        self.assertEqual(payload["required_invites_for_verified"], 5)
+        self.assertEqual(payload["remaining_to_verified"], 3)
+        self.assertFalse(payload["is_verified"])
+        self.assertEqual(payload["download_link"], "https://api.dinosocial.ir")
+
+    def test_profile_referral_summary_excludes_same_device_referrals(self):
+        self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "owner_same_device",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "device_id": "shared-device",
+            },
+        )
+        owner_headers = self._auth_header("owner_same_device")
+
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            owner = User.query.filter_by(username="owner_same_device").first()
+            self.assertIsNotNone(owner)
+            referral_code = owner.referral_code
+
+        self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "same_device_invitee",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "referral_code": referral_code,
+                "device_id": "shared-device",
+            },
+        )
+        self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "other_device_invitee",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "referral_code": referral_code,
+                "device_id": "other-device",
+            },
+        )
+
+        response = self.client.get("/api/profiles/me/referral", headers=owner_headers)
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["joined_count"], 1)
+
+    def test_auth_users_device_endpoint_updates_device_id(self):
+        self._register("device_sync_user")
+        headers = self._auth_header("device_sync_user")
+
+        response = self.client.post(
+            "/api/auth/users/device",
+            headers=headers,
+            json={"device_id": "synced-device-1"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["message"], "Device ID updated")
+
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            user = User.query.filter_by(username="device_sync_user").first()
+            self.assertIsNotNone(user)
+            self.assertEqual(user.device_id, "synced-device-1")
 
     def test_register_stores_argon2id_password_hash(self):
         register_response = self.client.post(
@@ -1524,7 +1742,7 @@ class TestApiRoutes(unittest.TestCase):
         media = list_resp.get_json()["posts"][0]["media"][0]
         self.assertTrue(media["mime_type"].startswith("audio/"))
 
-    def test_create_post_rejects_when_same_user_upload_is_already_in_progress(self):
+    def test_create_post_ignores_legacy_upload_lock_key(self):
         self._register("alice")
         headers = self._auth_header("alice")
         lock_key = f"{self.app.config['POST_UPLOAD_LOCK_KEY_PREFIX']}:alice"
@@ -1536,11 +1754,74 @@ class TestApiRoutes(unittest.TestCase):
             headers=headers,
         )
 
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(
-            response.get_json()["error"],
-            "Another post upload is already in progress",
+        self.assertEqual(response.status_code, 201)
+        self.assertIn("post_id", response.get_json())
+
+    def test_create_post_idempotency_key_returns_same_post_for_retry(self):
+        self._register("alice")
+        headers = self._auth_header("alice")
+        headers["Idempotency-Key"] = "android-post-job-1"
+
+        first = self.client.post(
+            "/api/posts",
+            json={"text": "retry-safe post"},
+            headers=headers,
         )
+        self.assertEqual(first.status_code, 201)
+        first_post_id = first.get_json()["post_id"]
+
+        second = self.client.post(
+            "/api/posts",
+            json={"text": "retry-safe post"},
+            headers=headers,
+        )
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(second.get_json()["post_id"], first_post_id)
+
+        feed = self.client.get("/api/posts", headers=headers)
+        self.assertEqual(feed.status_code, 200)
+        self.assertEqual(feed.get_json()["total"], 1)
+
+    def test_create_post_idempotency_result_ignores_legacy_upload_lock_key(self):
+        self._register("alice")
+        headers = self._auth_header("alice")
+        headers["Idempotency-Key"] = "android-post-job-2"
+
+        first = self.client.post(
+            "/api/posts",
+            json={"text": "background retry"},
+            headers=headers,
+        )
+        self.assertEqual(first.status_code, 201)
+        first_post_id = first.get_json()["post_id"]
+
+        lock_key = f"{self.app.config['POST_UPLOAD_LOCK_KEY_PREFIX']}:alice"
+        self.fake_redis.set(lock_key, "in-flight")
+        second = self.client.post(
+            "/api/posts",
+            json={"text": "background retry"},
+            headers=headers,
+        )
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(second.get_json()["post_id"], first_post_id)
+
+    def test_create_post_client_post_id_is_used_for_idempotent_retry(self):
+        self._register("alice")
+        headers = self._auth_header("alice")
+        payload = {
+            "text": "retry with body key",
+            "client_post_id": "worker-job-abc",
+        }
+
+        first = self.client.post("/api/posts", json=payload, headers=headers)
+        self.assertEqual(first.status_code, 201)
+        second = self.client.post("/api/posts", json=payload, headers=headers)
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(second.get_json()["post_id"], first.get_json()["post_id"])
+
+        feed = self.client.get("/api/posts", headers=headers)
+        self.assertEqual(feed.status_code, 200)
+        self.assertEqual(feed.get_json()["total"], 1)
 
     def test_playlist_adds_music_track_and_lists_it(self):
         self._register("alice")

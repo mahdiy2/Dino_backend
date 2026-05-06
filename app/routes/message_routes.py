@@ -107,3 +107,81 @@ def group_history(group_id):
             "next_before": payload["next_before"],
         }
     ), 200
+
+
+@message_bp.route("/reactions", methods=["POST"])
+@jwt_required()
+def react_to_message():
+    username = get_jwt_identity()
+    body = request.get_json(silent=True) or {}
+    message_id = body.get("message_id")
+    emoji = body.get("emoji")
+
+    if not isinstance(message_id, str) or not message_id.strip():
+        return jsonify({"error": "message_id is required"}), 400
+    if emoji is not None and not isinstance(emoji, str):
+        return jsonify({"error": "emoji must be a string"}), 400
+
+    message_id = message_id.strip()
+    if isinstance(emoji, str):
+        emoji = emoji.strip() or None
+
+    context = message_service.get_message_scope_context(message_id)
+    if not isinstance(context, dict):
+        return jsonify({"error": "Message not found"}), 404
+
+    scope = context.get("scope")
+    if scope == "private":
+        sender = context.get("sender")
+        recipient = context.get("recipient")
+        if username != sender and username != recipient:
+            return jsonify({"error": "Not allowed"}), 403
+        counterpart = recipient if username == sender else sender
+        if emoji is None:
+            message_service.remove_message_reaction(message_id, username)
+        else:
+            message_service.set_message_reaction(
+                message_id=message_id,
+                username=username,
+                emoji=emoji,
+                message_scope="private",
+                chat_counterpart=counterpart,
+            )
+        reactions = message_service.get_message_reactions(message_id)
+        return jsonify(
+            {
+                "scope": "private",
+                "message_id": message_id,
+                "chat_id": counterpart,
+                "reactions": reactions,
+            }
+        ), 200
+
+    if scope == "group":
+        group_id = context.get("group_id")
+        from app.repositories import group_repository, user_repository
+
+        user = user_repository.get_by_username(username)
+        if not user or not group_repository.is_member(group_id, user.id):
+            return jsonify({"error": "You are not a member of this group"}), 403
+        if emoji is None:
+            message_service.remove_message_reaction(message_id, username)
+        else:
+            message_service.set_message_reaction(
+                message_id=message_id,
+                username=username,
+                emoji=emoji,
+                message_scope="group",
+                group_id=group_id,
+            )
+        reactions = message_service.get_message_reactions(message_id)
+        return jsonify(
+            {
+                "scope": "group",
+                "group_id": int(group_id),
+                "message_id": message_id,
+                "reactions": reactions,
+            }
+        ), 200
+
+    return jsonify({"error": "Unsupported message scope"}), 400

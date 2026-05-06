@@ -25,6 +25,8 @@ def create_pending_registration(
     password_hash: str,
     public_key: str,
     name: str,
+    referral_code: str | None,
+    device_id: str | None,
     expires_at: datetime,
     client_nonce: str | None = None,
 ):
@@ -34,6 +36,8 @@ def create_pending_registration(
         password_hash=password_hash,
         public_key=public_key,
         name=name,
+        referral_code=referral_code,
+        device_id=device_id,
         expires_at=expires_at,
         client_nonce=client_nonce,
     )
@@ -48,6 +52,8 @@ def update_pending_registration(
     password_hash: str,
     public_key: str,
     name: str,
+    referral_code: str | None,
+    device_id: str | None,
     expires_at: datetime,
     client_nonce: str | None = None,
 ):
@@ -55,6 +61,8 @@ def update_pending_registration(
     pending.password_hash = password_hash
     pending.public_key = public_key
     pending.name = name
+    pending.referral_code = referral_code
+    pending.device_id = device_id
     pending.expires_at = expires_at
     pending.client_nonce = client_nonce
     db.session.commit()

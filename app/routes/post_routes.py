@@ -78,6 +78,28 @@ def _parse_optional_post_id(value):
     raise ValueError("quoted_post_id must be a positive integer")
 
 
+def _extract_post_idempotency_key(data, *, header_value=None):
+    candidates = [header_value]
+    if hasattr(data, "get"):
+        candidates.extend(
+            [
+                data.get("idempotency_key"),
+                data.get("client_post_id"),
+                data.get("client_nonce"),
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if not isinstance(candidate, str):
+            raise ValueError("idempotency_key must be a string")
+        normalized = candidate.strip()
+        if normalized:
+            return normalized
+    return None
+
+
 @post_bp.route("/posts", methods=["POST"])
 @jwt_required()
 def create_post():
@@ -90,6 +112,11 @@ def create_post():
     track_title = None
     track_artist = None
     quoted_post_id = None
+    idempotency_key = None
+    idempotency_key_header = (
+        request.headers.get("Idempotency-Key")
+        or request.headers.get("X-Idempotency-Key")
+    )
 
     if "multipart/form-data" in content_type:
         text = request.form.get("text")
@@ -101,6 +128,13 @@ def create_post():
             return jsonify({"error": str(e)}), 400
         try:
             followers_only = _parse_followers_only(request.form.get("followers_only"))
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        try:
+            idempotency_key = _extract_post_idempotency_key(
+                request.form,
+                header_value=idempotency_key_header,
+            )
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         files = (
@@ -124,6 +158,13 @@ def create_post():
             followers_only = _parse_followers_only(data.get("followers_only"))
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
+        try:
+            idempotency_key = _extract_post_idempotency_key(
+                data,
+                header_value=idempotency_key_header,
+            )
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
 
     try:
         result = create_post_with_media(
@@ -134,6 +175,7 @@ def create_post():
             track_title=track_title,
             track_artist=track_artist,
             quoted_post_id=quoted_post_id,
+            idempotency_key=idempotency_key,
         )
         return jsonify({
             "message": "Post created successfully",

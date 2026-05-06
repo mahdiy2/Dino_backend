@@ -192,3 +192,38 @@ class GroupMessageKeyRecipient(db.Model):
             "group_key_ref",
         ),
     )
+
+
+class MessageReaction(db.Model):
+    __tablename__ = "message_reactions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    message_id = db.Column(db.String(64), nullable=False, index=True)
+    message_scope = db.Column(db.String(16), nullable=False, index=True)
+    group_id = db.Column(db.Integer, nullable=True, index=True)
+    chat_counterpart = db.Column(db.String(80), nullable=True, index=True)
+    username = db.Column(db.String(80), nullable=False, index=True)
+    emoji = db.Column(db.String(32), nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        index=True,
+    )
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "message_id",
+            "username",
+            name="uq_message_reaction_message_user",
+        ),
+        db.Index(
+            "ix_message_reactions_scope_lookup",
+            "message_scope",
+            "group_id",
+            "chat_counterpart",
+            "message_id",
+        ),
+    )

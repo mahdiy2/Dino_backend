@@ -83,11 +83,13 @@ class TestSocketMessageFlow(unittest.TestCase):
                 GroupMessageKeyRecipient,
                 GroupMessageRecipient,
                 GroupMessageUserDelete,
+                MessageReaction,
                 PrivateMessage,
                 PrivateMessageUserDelete,
             )
             from app.models.group_model import Group, GroupMember
 
+            self.db.session.query(MessageReaction).delete()
             self.db.session.query(GroupMessageUserDelete).delete()
             self.db.session.query(PrivateMessageUserDelete).delete()
             self.db.session.query(GroupMessageRecipient).delete()
@@ -1898,6 +1900,133 @@ class TestSocketMessageFlow(unittest.TestCase):
             for message in alice_history_resp.get_json().get("messages", [])
         }
         self.assertIn(message_id, alice_history_ids)
+
+    def test_private_reaction_is_broadcast_and_persisted_in_history(self):
+        alice = self._connect(self.alice_token)
+        bob = self._connect(self.bob_token)
+        alice.get_received()
+        bob.get_received()
+
+        self._emit_private_message(
+            alice,
+            {
+                "to": "bob",
+                "message": "enc-msg-react-private",
+                "encrypted_key": "key-react-private",
+            },
+        )
+        alice_events = alice.get_received()
+        sent_events = [event for event in alice_events if event["name"] == "message_sent"]
+        self.assertEqual(len(sent_events), 1)
+        message_id = sent_events[0]["args"][0]["message_id"]
+        bob.get_received()
+
+        bob.emit("react_to_message", {"message_id": message_id, "emoji": "🔥"})
+        bob_reaction_events = [
+            event for event in bob.get_received() if event["name"] == "message_reaction_applied"
+        ]
+        self.assertEqual(len(bob_reaction_events), 1)
+        self.assertEqual(
+            bob_reaction_events[0]["args"][0].get("scope"),
+            "private",
+        )
+
+        alice_updates = [
+            event for event in alice.get_received() if event["name"] == "message_reaction_updated"
+        ]
+        self.assertEqual(len(alice_updates), 1)
+        self.assertEqual(
+            alice_updates[0]["args"][0].get("message_id"),
+            message_id,
+        )
+        self.assertEqual(
+            alice_updates[0]["args"][0].get("chat_id"),
+            "bob",
+        )
+        reaction_map = {
+            (item or {}).get("username"): (item or {}).get("emoji")
+            for item in alice_updates[0]["args"][0].get("reactions", [])
+        }
+        self.assertEqual(reaction_map.get("bob"), "🔥")
+
+        http_client = self.app.test_client()
+        history_resp = http_client.get(
+            "/api/messages/history/private/alice",
+            headers=self._auth_headers(self.bob_token),
+        )
+        self.assertEqual(history_resp.status_code, 200)
+        target = next(
+            (
+                message
+                for message in history_resp.get_json().get("messages", [])
+                if (message or {}).get("message_id") == message_id
+            ),
+            None,
+        )
+        self.assertIsNotNone(target)
+        stored_reactions = {
+            (item or {}).get("username"): (item or {}).get("emoji")
+            for item in (target or {}).get("reactions", [])
+        }
+        self.assertEqual(stored_reactions.get("bob"), "🔥")
+
+    def test_group_reaction_is_broadcast_and_persisted_in_history(self):
+        group_id = self._create_group(name="group-reaction")
+        alice = self._connect(self.alice_token)
+        bob = self._connect(self.bob_token)
+        alice.get_received()
+        bob.get_received()
+
+        self._emit_group_message(
+            alice,
+            {
+                "group_id": group_id,
+                "message": "enc-msg-react-group",
+                "encrypted_keys": {"alice": "alice-key", "bob": "bob-key"},
+            },
+        )
+        alice_events = alice.get_received()
+        sent_events = [event for event in alice_events if event["name"] == "group_message_sent"]
+        self.assertEqual(len(sent_events), 1)
+        message_id = sent_events[0]["args"][0]["message_id"]
+        bob.get_received()
+
+        bob.emit("react_to_message", {"message_id": message_id, "emoji": "👍"})
+
+        alice_updates = [
+            event for event in alice.get_received() if event["name"] == "message_reaction_updated"
+        ]
+        self.assertEqual(len(alice_updates), 1)
+        payload = alice_updates[0]["args"][0]
+        self.assertEqual(payload.get("scope"), "group")
+        self.assertEqual(payload.get("group_id"), group_id)
+        self.assertEqual(payload.get("message_id"), message_id)
+        reaction_map = {
+            (item or {}).get("username"): (item or {}).get("emoji")
+            for item in payload.get("reactions", [])
+        }
+        self.assertEqual(reaction_map.get("bob"), "👍")
+
+        http_client = self.app.test_client()
+        history_resp = http_client.get(
+            f"/api/messages/history/group/{group_id}",
+            headers=self._auth_headers(self.bob_token),
+        )
+        self.assertEqual(history_resp.status_code, 200)
+        target = next(
+            (
+                message
+                for message in history_resp.get_json().get("messages", [])
+                if (message or {}).get("message_id") == message_id
+            ),
+            None,
+        )
+        self.assertIsNotNone(target)
+        stored_reactions = {
+            (item or {}).get("username"): (item or {}).get("emoji")
+            for item in (target or {}).get("reactions", [])
+        }
+        self.assertEqual(stored_reactions.get("bob"), "👍")
 
     def test_private_delete_for_everyone_rejects_unknown_message_id(self):
         alice = self._connect(self.alice_token)

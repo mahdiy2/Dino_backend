@@ -14,6 +14,7 @@ from app.models.chat_message_model import (
     GroupMessage,
     GroupMessageKeyRecipient,
     GroupMessageRecipient,
+    MessageReaction,
     PrivateMessageUserDelete,
     PrivateMessage,
 )
@@ -190,9 +191,12 @@ def build_group_message_payload_for_recipient(payload, recipient_username):
     return scoped_payload
 
 
-def _private_message_to_payload(row):
+def _private_message_to_payload(row, reactions=None):
     if row is None:
         return None
+    resolved_reactions = reactions
+    if resolved_reactions is None:
+        resolved_reactions = get_message_reactions(row.message_id)
     return {
         "from": row.sender_username,
         "type": row.message_type or "text",
@@ -206,11 +210,12 @@ def _private_message_to_payload(row):
         "reply_to_sender": row.reply_to_sender,
         "encrypted_reply_preview": row.encrypted_reply_preview,
         "encrypted_reply_key": row.encrypted_reply_key,
+        "reactions": resolved_reactions,
     }
 
 
-def _private_message_to_payload_for_viewer(row, viewer_username):
-    payload = _private_message_to_payload(row)
+def _private_message_to_payload_for_viewer(row, viewer_username, reactions=None):
+    payload = _private_message_to_payload(row, reactions=reactions)
     if (
         not isinstance(payload, dict)
         or not viewer_username
@@ -230,6 +235,7 @@ def _group_message_to_payload(
     row,
     recipient_username=None,
     recipient_encrypted_key=None,
+    reactions=None,
 ):
     if row is None:
         return None
@@ -262,6 +268,9 @@ def _group_message_to_payload(
     ):
         encrypted_keys = {recipient_username: recipient_encrypted_key}
 
+    resolved_reactions = reactions
+    if resolved_reactions is None:
+        resolved_reactions = get_message_reactions(row.message_id)
     payload = {
         "from": row.sender_username,
         "group_id": row.group_id,
@@ -276,6 +285,7 @@ def _group_message_to_payload(
         "reply_to_message_id": row.reply_to_message_id,
         "reply_to_sender": row.reply_to_sender,
         "encrypted_reply_preview": row.encrypted_reply_preview,
+        "reactions": resolved_reactions,
     }
     if recipient_encrypted_key:
         payload["encrypted_key"] = recipient_encrypted_key
@@ -1314,9 +1324,20 @@ def get_private_message_history(username, chat_id, limit=50, before_timestamp=No
     if has_more and rows:
         next_before = _format_iso_datetime(rows[0].timestamp)
 
+    message_ids = [
+        row.message_id
+        for row in rows
+        if isinstance(row.message_id, str) and row.message_id
+    ]
+    reactions_by_message_id = get_message_reactions_bulk(message_ids)
+
     return {
         "messages": [
-            _private_message_to_payload_for_viewer(row, username)
+            _private_message_to_payload_for_viewer(
+                row,
+                username,
+                reactions=reactions_by_message_id.get(row.message_id, []),
+            )
             for row in rows
         ],
         "has_more": has_more,
@@ -1597,6 +1618,201 @@ def get_message_metadata(message_id):
             }
 
     return None
+
+
+def get_message_scope_context(message_id):
+    if not isinstance(message_id, str) or not message_id:
+        return None
+
+    if _db_available():
+        group_row = GroupMessage.query.filter_by(message_id=message_id).first()
+        if group_row is not None:
+            return {
+                "scope": "group",
+                "group_id": int(group_row.group_id),
+                "sender": group_row.sender_username,
+            }
+
+        private_row = PrivateMessage.query.filter_by(message_id=message_id).first()
+        if private_row is not None:
+            sender = private_row.sender_username
+            recipient = private_row.recipient_username
+            if not sender or not recipient:
+                return None
+            return {
+                "scope": "private",
+                "sender": sender,
+                "recipient": recipient,
+            }
+
+    metadata = get_message_metadata(message_id)
+    if not isinstance(metadata, dict):
+        return None
+    metadata_type = metadata.get("type")
+    if metadata_type == "private":
+        sender = metadata.get("sender")
+        recipient = metadata.get("recipient")
+        if isinstance(sender, str) and sender and isinstance(recipient, str) and recipient:
+            return {
+                "scope": "private",
+                "sender": sender,
+                "recipient": recipient,
+            }
+    if metadata_type == "group":
+        group_id = metadata.get("group_id")
+        sender = metadata.get("sender")
+        try:
+            normalized_group_id = int(group_id)
+        except (TypeError, ValueError):
+            return None
+        if normalized_group_id > 0:
+            return {
+                "scope": "group",
+                "group_id": normalized_group_id,
+                "sender": sender,
+            }
+    return None
+
+
+def _normalize_reaction_emoji(raw_emoji):
+    if not isinstance(raw_emoji, str):
+        return None
+    normalized = raw_emoji.strip()
+    if not normalized:
+        return None
+    if len(normalized) > 32:
+        return None
+    return normalized
+
+
+def get_message_reactions(message_id):
+    if not isinstance(message_id, str) or not message_id:
+        return []
+    if not _db_available():
+        return []
+
+    rows = (
+        MessageReaction.query.filter(
+            MessageReaction.message_id == message_id
+        )
+        .order_by(MessageReaction.created_at.asc(), MessageReaction.id.asc())
+        .all()
+    )
+    return [
+        {
+            "username": row.username,
+            "emoji": row.emoji,
+            "updated_at": _format_iso_datetime(row.updated_at),
+        }
+        for row in rows
+    ]
+
+
+def get_message_reactions_bulk(message_ids):
+    normalized_ids = _normalize_message_ids(message_ids)
+    if not normalized_ids:
+        return {}
+    if not _db_available():
+        return {}
+
+    rows = (
+        MessageReaction.query.filter(
+            MessageReaction.message_id.in_(normalized_ids)
+        )
+        .order_by(
+            MessageReaction.message_id.asc(),
+            MessageReaction.created_at.asc(),
+            MessageReaction.id.asc(),
+        )
+        .all()
+    )
+
+    grouped = {message_id: [] for message_id in normalized_ids}
+    for row in rows:
+        grouped.setdefault(row.message_id, []).append(
+            {
+                "username": row.username,
+                "emoji": row.emoji,
+                "updated_at": _format_iso_datetime(row.updated_at),
+            }
+        )
+    return grouped
+
+
+def set_message_reaction(
+    *,
+    message_id,
+    username,
+    emoji,
+    message_scope,
+    group_id=None,
+    chat_counterpart=None,
+):
+    if not _db_available():
+        raise ValueError("Database unavailable")
+    if not isinstance(message_id, str) or not message_id:
+        raise ValueError("message_id is required")
+    if not isinstance(username, str) or not username.strip():
+        raise ValueError("username is required")
+    normalized_emoji = _normalize_reaction_emoji(emoji)
+    if not normalized_emoji:
+        raise ValueError("emoji is required")
+    if message_scope not in {"private", "group"}:
+        raise ValueError("message_scope is invalid")
+
+    normalized_username = username.strip()
+    normalized_counterpart = None
+    normalized_group_id = None
+    if message_scope == "private":
+        if not isinstance(chat_counterpart, str) or not chat_counterpart.strip():
+            raise ValueError("chat_counterpart is required for private reactions")
+        normalized_counterpart = chat_counterpart.strip()
+    else:
+        try:
+            normalized_group_id = int(group_id)
+        except (TypeError, ValueError):
+            raise ValueError("group_id is required for group reactions")
+        if normalized_group_id <= 0:
+            raise ValueError("group_id is invalid")
+
+    row = MessageReaction.query.filter_by(
+        message_id=message_id,
+        username=normalized_username,
+    ).first()
+
+    if row is None:
+        row = MessageReaction(
+            message_id=message_id,
+            username=normalized_username,
+        )
+        db.session.add(row)
+
+    row.message_scope = message_scope
+    row.group_id = normalized_group_id
+    row.chat_counterpart = normalized_counterpart
+    row.emoji = normalized_emoji
+    row.updated_at = _utc_now_naive()
+    db.session.commit()
+    return True
+
+
+def remove_message_reaction(message_id, username):
+    if not _db_available():
+        return False
+    if not isinstance(message_id, str) or not message_id:
+        return False
+    if not isinstance(username, str) or not username.strip():
+        return False
+
+    row = MessageReaction.query.filter_by(
+        message_id=message_id,
+        username=username.strip(),
+    ).first()
+    if row is None:
+        return False
+    db.session.delete(row)
+    db.session.commit()
+    return True
 
 
 def get_message_metadata_bulk(message_ids):
@@ -2918,6 +3134,20 @@ def get_group_message_history(group_id, username=None, limit=50, before_timestam
         first_row = rows[0][0] if username else rows[0]
         next_before = _format_iso_datetime(first_row.timestamp)
 
+    if normalized_username:
+        message_ids = [
+            message_row.message_id
+            for message_row, _recipient_encrypted_key in rows
+            if isinstance(message_row.message_id, str) and message_row.message_id
+        ]
+    else:
+        message_ids = [
+            row.message_id
+            for row in rows
+            if isinstance(row.message_id, str) and row.message_id
+        ]
+    reactions_by_message_id = get_message_reactions_bulk(message_ids)
+
     payloads = []
     if normalized_username:
         for message_row, recipient_encrypted_key in rows:
@@ -2925,6 +3155,7 @@ def get_group_message_history(group_id, username=None, limit=50, before_timestam
                 message_row,
                 recipient_username=normalized_username,
                 recipient_encrypted_key=recipient_encrypted_key,
+                reactions=reactions_by_message_id.get(message_row.message_id, []),
             )
             if (
                 message_row.sender_username != normalized_username
@@ -2933,7 +3164,13 @@ def get_group_message_history(group_id, username=None, limit=50, before_timestam
                 continue
             payloads.append(payload)
     else:
-        payloads = [_group_message_to_payload(row) for row in rows]
+        payloads = [
+            _group_message_to_payload(
+                row,
+                reactions=reactions_by_message_id.get(row.message_id, []),
+            )
+            for row in rows
+        ]
 
     return {
         "messages": payloads,

@@ -16,10 +16,20 @@ class User(db.Model):
     suspension_reason = db.Column(db.String(32), nullable=True)
     suspended_by_report_id = db.Column(db.Integer, nullable=True, index=True)
     badge = db.Column(db.String(64), nullable=True, index=True)
+    referral_code = db.Column(db.String(16), unique=True, nullable=True, index=True)
+    device_id = db.Column(db.String(128), nullable=True, index=True)
+    referred_by_user_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     def to_dict(self):
         return {
             'username': self.username,
             'public_key': self.public_key,
             'badge': self.badge,
+            'referral_code': self.referral_code,
+            'device_id': self.device_id,
         }

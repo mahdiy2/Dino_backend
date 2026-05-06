@@ -3,8 +3,6 @@ import uuid
 
 from flask import current_app, has_request_context, request
 from minio.error import S3Error
-from sqlalchemy import or_
-
 from app.db import db
 from app.extensions.minio_client import get_minio_client
 from app.models.activity_notification_model import ActivityNotification
@@ -165,6 +163,7 @@ def _serialize_profile(user, profile):
         "username": user.username,
         "name": profile.name,
         "badge": user.badge,
+        "referral_code": user.referral_code,
         "bio": profile.bio,
         "profile_image_url": _build_profile_media_url(profile.image_object_name),
         "profile_image_shape": (
@@ -176,6 +175,39 @@ def _serialize_profile(user, profile):
         "followers_count": count_followers(user.id),
         "following_count": count_following(user.id),
         "posts_count": Post.query.filter_by(author_id=user.id, is_hidden=False).count(),
+    }
+
+
+def get_referral_summary(username: str):
+    user = user_repository.get_by_username(username)
+    if not user or getattr(user, "is_suspended", False):
+        raise ValueError("User not found")
+
+    referral_code = (user.referral_code or "").strip().upper()
+    if not referral_code:
+        raise ValueError("Referral code not available")
+
+    inviter_device_id = (user.device_id or "").strip()
+    joined_query = db.session.query(User.id).filter(
+        User.referred_by_user_id == user.id,
+        User.is_suspended.is_(False),
+    )
+    joined_query = joined_query.filter(
+        User.device_id.isnot(None),
+        User.device_id != "",
+    )
+    if inviter_device_id:
+        joined_query = joined_query.filter(User.device_id != inviter_device_id)
+    joined_count = joined_query.count()
+    required_invites_for_verified = 5
+
+    return {
+        "referral_code": referral_code,
+        "joined_count": joined_count,
+        "required_invites_for_verified": required_invites_for_verified,
+        "remaining_to_verified": max(required_invites_for_verified - joined_count, 0),
+        "is_verified": (user.badge or "").strip().lower() == "verified",
+        "download_link": "https://api.dinosocial.ir",
     }
 
 
@@ -523,6 +555,13 @@ def delete_account(username: str):
     )
 
     try:
+        User.query.filter(
+            User.referred_by_user_id == user_id
+        ).update(
+            {User.referred_by_user_id: None},
+            synchronize_session=False,
+        )
+
         if removable_comment_ids:
             Vote.query.filter(
                 Vote.target_type == "comment",

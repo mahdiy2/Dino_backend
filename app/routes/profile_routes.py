@@ -22,6 +22,17 @@ def get_my_profile():
         return jsonify({"error": str(e)}), 404
 
 
+@profile_bp.route("/profiles/me/referral", methods=["GET"])
+@jwt_required()
+def get_my_referral_summary():
+    username = get_jwt_identity()
+    try:
+        payload = profile_service.get_referral_summary(username=username)
+        return jsonify(payload), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+
+
 @profile_bp.route("/profiles/me", methods=["PUT"])
 @jwt_required()
 def update_my_profile():

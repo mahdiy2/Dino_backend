@@ -201,6 +201,26 @@ class Config:
         30,
         _env_int("POST_UPLOAD_LOCK_TTL_SECONDS", 300),
     )
+    POST_UPLOAD_IDEMPOTENCY_KEY_PREFIX = _env_str(
+        "POST_UPLOAD_IDEMPOTENCY_KEY_PREFIX",
+        "post_upload:idempotency",
+    )
+    POST_UPLOAD_IDEMPOTENCY_RESULT_TTL_SECONDS = max(
+        300,
+        _env_int("POST_UPLOAD_IDEMPOTENCY_RESULT_TTL_SECONDS", 24 * 60 * 60),
+    )
+    POST_UPLOAD_IDEMPOTENCY_PROCESSING_TTL_SECONDS = max(
+        60,
+        _env_int("POST_UPLOAD_IDEMPOTENCY_PROCESSING_TTL_SECONDS", 30 * 60),
+    )
+    POST_UPLOAD_IDEMPOTENCY_WAIT_SECONDS = max(
+        0.0,
+        _env_float("POST_UPLOAD_IDEMPOTENCY_WAIT_SECONDS", 15.0),
+    )
+    POST_UPLOAD_IDEMPOTENCY_POLL_INTERVAL_SECONDS = max(
+        0.05,
+        _env_float("POST_UPLOAD_IDEMPOTENCY_POLL_INTERVAL_SECONDS", 0.25),
+    )
     PROFILE_VIDEO_MAX_DURATION_SECONDS = int(
         os.getenv("PROFILE_VIDEO_MAX_DURATION_SECONDS", "5")
     )

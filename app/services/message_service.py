@@ -647,6 +647,37 @@ def get_message_metadata_bulk(message_ids):
     return message_repository.get_message_metadata_bulk(message_ids)
 
 
+def get_message_scope_context(message_id):
+    return message_repository.get_message_scope_context(message_id)
+
+
+def get_message_reactions(message_id):
+    return message_repository.get_message_reactions(message_id)
+
+
+def set_message_reaction(
+    *,
+    message_id,
+    username,
+    emoji,
+    message_scope,
+    group_id=None,
+    chat_counterpart=None,
+):
+    return message_repository.set_message_reaction(
+        message_id=message_id,
+        username=username,
+        emoji=emoji,
+        message_scope=message_scope,
+        group_id=group_id,
+        chat_counterpart=chat_counterpart,
+    )
+
+
+def remove_message_reaction(message_id, username):
+    return message_repository.remove_message_reaction(message_id, username)
+
+
 def delete_message_metadata(message_id):
     return message_repository.delete_message_metadata(message_id)
 

@@ -27,6 +27,8 @@ def register():
             data.get("password"),
             data.get("public_key"),
             data.get("name"),
+            data.get("referral_code"),
+            data.get("device_id"),
         )
         return jsonify({"message": "User registered"}), 201
     except ValueError as e:
@@ -46,6 +48,8 @@ def register_start():
             data.get("public_key"),
             data.get("name"),
             data.get("client_nonce"),
+            data.get("referral_code"),
+            data.get("device_id"),
         )
         return jsonify(
             {
@@ -150,3 +154,21 @@ def get_key_status():
     except ValueError as e:
         return _auth_error_response(e, fallback_status_code=401)
     return jsonify(status), 200
+
+
+@auth_bp.route("/users/device", methods=["POST"])
+@jwt_required()
+def update_device_id():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    username = get_jwt_identity()
+    try:
+        payload = auth_service.update_user_device_id(
+            username=username,
+            device_id=data.get("device_id"),
+        )
+        return jsonify(payload), 200
+    except ValueError as e:
+        return _auth_error_response(e)
