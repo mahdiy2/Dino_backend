@@ -211,6 +211,28 @@ class TestApiRoutes(unittest.TestCase):
             "This device is blocked and cannot create a new account",
         )
 
+    def test_block_device_is_idempotent_and_merges_missing_metadata(self):
+        with self.app.app_context():
+            from app.repositories import banned_device_repository
+
+            first = banned_device_repository.block_device(
+                "android-device-blocked-merge-1",
+                reason="reported_account",
+            )
+            second = banned_device_repository.block_device(
+                "android-device-blocked-merge-1",
+                blocked_user_id=42,
+                blocked_by_report_id=77,
+                reason="other_reason_should_not_override",
+            )
+
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            self.assertEqual(first.id, second.id)
+            self.assertEqual(second.blocked_user_id, 42)
+            self.assertEqual(second.blocked_by_report_id, 77)
+            self.assertEqual(second.reason, "reported_account")
+
     def test_report_delete_account_blocks_device_for_future_registrations(self):
         self._register("alice")
         self._register("admin")
