@@ -13,7 +13,11 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from app.db import db
 from app.extensions import redis_client as redis_backend
-from app.repositories import pending_registration_repository, user_repository
+from app.repositories import (
+    banned_device_repository,
+    pending_registration_repository,
+    user_repository,
+)
 from app.repositories import follow_repository, group_repository
 from app.services import password_security, referral_service
 
@@ -328,6 +332,16 @@ def _normalize_device_id(device_id):
     return normalized
 
 
+def _ensure_device_not_blocked(device_id: str | None):
+    if not device_id:
+        return
+    if banned_device_repository.get_by_device_id(device_id):
+        raise AuthError(
+            "This device is blocked and cannot create a new account",
+            status_code=403,
+        )
+
+
 def _generate_unique_referral_code(reserved_codes: set[str] | None = None) -> str:
     reserved = reserved_codes or set()
 
@@ -452,6 +466,7 @@ def register(
         raise AuthError("Username already exists", status_code=400)
 
     normalized_device_id = _normalize_device_id(device_id)
+    _ensure_device_not_blocked(normalized_device_id)
     normalized_referral_code, referred_by_user_id = _resolve_referrer_id_for_new_user(
         username=username,
         referral_code=referral_code,
@@ -497,6 +512,7 @@ def start_registration(
         raise AuthError("Username already exists", status_code=409)
 
     normalized_device_id = _normalize_device_id(device_id)
+    _ensure_device_not_blocked(normalized_device_id)
     normalized_referral_code, _ = _resolve_referrer_id_for_new_user(
         username=username,
         referral_code=referral_code,
@@ -571,6 +587,8 @@ def confirm_registration(registration_id):
         raise AuthError("Username already exists", status_code=409)
 
     referred_by_user_id = None
+    normalized_pending_device_id = _normalize_device_id(pending.device_id)
+    _ensure_device_not_blocked(normalized_pending_device_id)
     normalized_pending_referral_code = (pending.referral_code or "").strip().upper()
     if normalized_pending_referral_code:
         referrer = user_repository.get_by_referral_code(normalized_pending_referral_code)
@@ -584,7 +602,7 @@ def confirm_registration(registration_id):
             public_key=pending.public_key,
             name=pending.name,
             referral_code=_generate_unique_referral_code(),
-            device_id=_normalize_device_id(pending.device_id),
+            device_id=normalized_pending_device_id,
             referred_by_user_id=referred_by_user_id,
             auto_commit=False,
         )

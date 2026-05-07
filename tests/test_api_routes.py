@@ -187,6 +187,87 @@ class TestApiRoutes(unittest.TestCase):
             self.assertIsNotNone(user)
             self.assertEqual(user.device_id, "android-device-001")
 
+    def test_auth_register_rejects_blocked_device_id(self):
+        with self.app.app_context():
+            from app.repositories import banned_device_repository
+
+            banned_device_repository.block_device(
+                "android-device-blocked-1",
+                reason="reported_account",
+            )
+
+        register_response = self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "new_user",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "device_id": "android-device-blocked-1",
+            },
+        )
+        self.assertEqual(register_response.status_code, 403)
+        self.assertEqual(
+            register_response.get_json()["error"],
+            "This device is blocked and cannot create a new account",
+        )
+
+    def test_report_delete_account_blocks_device_for_future_registrations(self):
+        self._register("alice")
+        self._register("admin")
+        self._make_admin("admin")
+
+        bob_register = self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "bob",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "device_id": "android-banned-after-report-1",
+            },
+        )
+        self.assertEqual(bob_register.status_code, 201)
+
+        alice_headers = self._auth_header("alice")
+        bob_headers = self._auth_header("bob")
+        admin_headers = self._auth_header("admin")
+
+        create_post = self.client.post(
+            "/api/posts",
+            json={"text": "reported account post"},
+            headers=bob_headers,
+        )
+        post_id = create_post.get_json()["post_id"]
+
+        report_resp = self.client.post(
+            f"/api/posts/{post_id}/reports",
+            json={"report_type": "scam"},
+            headers=alice_headers,
+        )
+        self.assertEqual(report_resp.status_code, 201)
+        report_id = report_resp.get_json()["report_id"]
+
+        handle_resp = self.client.post(
+            f"/admin/api/reports/{report_id}/handle",
+            json={"decision": "delete_account"},
+            headers=admin_headers,
+        )
+        self.assertEqual(handle_resp.status_code, 200)
+
+        retry_register = self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "bob_retry",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "device_id": "android-banned-after-report-1",
+            },
+        )
+        self.assertEqual(retry_register.status_code, 403)
+        self.assertEqual(
+            retry_register.get_json()["error"],
+            "This device is blocked and cannot create a new account",
+        )
+
     def test_auth_register_rejects_invalid_referral_code(self):
         register_response = self.client.post(
             "/api/auth/register",
@@ -237,6 +318,31 @@ class TestApiRoutes(unittest.TestCase):
             self.assertIsNotNone(invited)
             self.assertIsNotNone(ref_owner)
             self.assertEqual(invited.referred_by_user_id, ref_owner.id)
+
+    def test_auth_register_start_rejects_blocked_device_id(self):
+        with self.app.app_context():
+            from app.repositories import banned_device_repository
+
+            banned_device_repository.block_device(
+                "android-device-blocked-2",
+                reason="reported_account",
+            )
+
+        start_response = self.client.post(
+            "/api/auth/register/start",
+            json={
+                "username": "pending_user",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "client_nonce": "nonce-1",
+                "device_id": "android-device-blocked-2",
+            },
+        )
+        self.assertEqual(start_response.status_code, 403)
+        self.assertEqual(
+            start_response.get_json()["error"],
+            "This device is blocked and cannot create a new account",
+        )
 
     def test_profile_referral_summary_endpoint(self):
         self.client.post(

@@ -46,6 +46,7 @@ import app.models.activity_notification_model  # noqa: F401 – register model w
 import app.models.about_us_model  # noqa: F401 – register model with SQLAlchemy
 import app.models.app_update_model  # noqa: F401 – register model with SQLAlchemy
 import app.models.block_model  # noqa: F401 – register model with SQLAlchemy
+import app.models.banned_device_model  # noqa: F401 – register model with SQLAlchemy
 import app.models.chat_message_model  # noqa: F401 – register model with SQLAlchemy
 import app.models.crash_log_model  # noqa: F401 – register model with SQLAlchemy
 import app.models.group_model  # noqa: F401 – register model with SQLAlchemy

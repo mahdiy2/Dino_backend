@@ -15,7 +15,7 @@ from app.models.profile_model import Profile
 from app.models.report_model import PostReport
 from app.models.user_model import User
 from app.models.vote_model import Vote
-from app.repositories import report_repository
+from app.repositories import banned_device_repository, report_repository
 
 
 REPORT_STATUS_PENDING = "pending"
@@ -344,6 +344,15 @@ def _soft_delete_user(
     user.suspension_reason = reason
     user.suspended_by_report_id = report_id
     user.purge_after = _max_datetime(user.purge_after, _purge_after_from(now))
+    normalized_device_id = (user.device_id or "").strip()
+    if normalized_device_id:
+        banned_device_repository.block_device(
+            normalized_device_id,
+            blocked_user_id=user.id,
+            blocked_by_report_id=report_id,
+            reason=reason,
+            auto_commit=False,
+        )
 
     posts = Post.query.filter_by(author_id=user.id).all()
     for post in posts:
