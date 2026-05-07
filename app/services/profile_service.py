@@ -25,7 +25,7 @@ from app.repositories import profile_video_repository, user_repository
 from app.repositories import message_repository
 from app.repositories.follow_repository import count_followers, count_following
 from app.repositories.profile_repository import create_profile_for_user, get_by_user_id
-from app.services import block_service
+from app.services import block_service, referral_service
 from app.services.media_security import (
     is_blocked_declared_mimetype,
     normalize_mimetype,
@@ -187,26 +187,19 @@ def get_referral_summary(username: str):
     if not referral_code:
         raise ValueError("Referral code not available")
 
-    inviter_device_id = (user.device_id or "").strip()
-    joined_query = db.session.query(User.id).filter(
-        User.referred_by_user_id == user.id,
-        User.is_suspended.is_(False),
+    badge_result = referral_service.maybe_grant_verified_badge_for_referrals(
+        referrer_user_id=user.id,
+        auto_commit=True,
     )
-    joined_query = joined_query.filter(
-        User.device_id.isnot(None),
-        User.device_id != "",
-    )
-    if inviter_device_id:
-        joined_query = joined_query.filter(User.device_id != inviter_device_id)
-    joined_count = joined_query.count()
-    required_invites_for_verified = 5
+    joined_count = badge_result["joined_count"]
+    required_invites_for_verified = referral_service.REFERRAL_VERIFIED_REQUIRED_INVITES
 
     return {
         "referral_code": referral_code,
         "joined_count": joined_count,
         "required_invites_for_verified": required_invites_for_verified,
         "remaining_to_verified": max(required_invites_for_verified - joined_count, 0),
-        "is_verified": (user.badge or "").strip().lower() == "verified",
+        "is_verified": badge_result["is_verified"],
         "download_link": "https://api.dinosocial.ir",
     }
 

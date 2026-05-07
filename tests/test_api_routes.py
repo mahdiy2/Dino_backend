@@ -287,6 +287,107 @@ class TestApiRoutes(unittest.TestCase):
         self.assertFalse(payload["is_verified"])
         self.assertEqual(payload["download_link"], "https://api.dinosocial.ir")
 
+    def test_auth_register_referral_auto_assigns_verified_badge_after_five_invites(self):
+        self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "ref_owner_auto",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "device_id": "owner-auto-device",
+            },
+        )
+
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            owner = User.query.filter_by(username="ref_owner_auto").first()
+            self.assertIsNotNone(owner)
+            referral_code = owner.referral_code
+
+        for index in range(1, 5):
+            response = self.client.post(
+                "/api/auth/register",
+                json={
+                    "username": f"auto_invitee_{index}",
+                    "password": "pass123",
+                    "public_key": TEST_RSA_PUBLIC_KEY,
+                    "referral_code": referral_code,
+                    "device_id": f"auto-device-{index}",
+                },
+            )
+            self.assertEqual(response.status_code, 201)
+
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            owner_after_four = User.query.filter_by(username="ref_owner_auto").first()
+            self.assertIsNotNone(owner_after_four)
+            self.assertNotEqual((owner_after_four.badge or "").strip().lower(), "verified")
+
+        fifth_response = self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "auto_invitee_5",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "referral_code": referral_code,
+                "device_id": "auto-device-5",
+            },
+        )
+        self.assertEqual(fifth_response.status_code, 201)
+
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            owner_after_five = User.query.filter_by(username="ref_owner_auto").first()
+            self.assertIsNotNone(owner_after_five)
+            self.assertEqual((owner_after_five.badge or "").strip().lower(), "verified")
+
+    def test_auth_register_confirm_referral_auto_assigns_verified_badge_after_five_invites(self):
+        self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "ref_owner_pending",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "device_id": "owner-pending-device",
+            },
+        )
+
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            owner = User.query.filter_by(username="ref_owner_pending").first()
+            self.assertIsNotNone(owner)
+            referral_code = owner.referral_code
+
+        for index in range(1, 6):
+            start_response = self.client.post(
+                "/api/auth/register/start",
+                json={
+                    "username": f"pending_auto_invitee_{index}",
+                    "password": "pass123",
+                    "public_key": TEST_RSA_PUBLIC_KEY,
+                    "referral_code": referral_code,
+                    "device_id": f"pending-auto-device-{index}",
+                },
+            )
+            self.assertEqual(start_response.status_code, 202)
+            registration_id = start_response.get_json()["registration_id"]
+            confirm_response = self.client.post(
+                "/api/auth/register/confirm",
+                json={"registration_id": registration_id},
+            )
+            self.assertEqual(confirm_response.status_code, 201)
+
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            owner_after_five = User.query.filter_by(username="ref_owner_pending").first()
+            self.assertIsNotNone(owner_after_five)
+            self.assertEqual((owner_after_five.badge or "").strip().lower(), "verified")
+
     def test_profile_referral_summary_excludes_same_device_referrals(self):
         self.client.post(
             "/api/auth/register",

@@ -15,7 +15,7 @@ from app.db import db
 from app.extensions import redis_client as redis_backend
 from app.repositories import pending_registration_repository, user_repository
 from app.repositories import follow_repository, group_repository
-from app.services import password_security
+from app.services import password_security, referral_service
 
 
 PENDING_REGISTRATION_TTL_SECONDS = 30 * 60
@@ -42,6 +42,19 @@ def _require_non_empty_string(value):
 def _cleanup_expired_pending_registrations():
     # Cleanup is cheap and keeps "username already pending" scenarios predictable.
     pending_registration_repository.delete_expired()
+
+
+def _best_effort_grant_referral_verified_badge(referrer_user_id: int | None):
+    if not referrer_user_id:
+        return
+    try:
+        referral_service.maybe_grant_verified_badge_for_referrals(referrer_user_id)
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception(
+            "Failed to grant referral verified badge for user_id=%s",
+            referrer_user_id,
+        )
 
 
 def _validate_password_strength(password):
@@ -454,6 +467,7 @@ def register(
         device_id=normalized_device_id,
         referred_by_user_id=referred_by_user_id,
     )
+    _best_effort_grant_referral_verified_badge(referred_by_user_id)
 
 
 def start_registration(
@@ -579,6 +593,7 @@ def confirm_registration(registration_id):
     except Exception:
         db.session.rollback()
         raise
+    _best_effort_grant_referral_verified_badge(referred_by_user_id)
 
 
 def authenticate_user_credentials(username, password):
