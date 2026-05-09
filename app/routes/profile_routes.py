@@ -21,10 +21,16 @@ def get_my_profile():
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
 
+REFERRAL_FEATURE_ENABLED = False
 
 @profile_bp.route("/profiles/me/referral", methods=["GET"])
 @jwt_required()
 def get_my_referral_summary():
+    if not REFERRAL_FEATURE_ENABLED:
+        return jsonify({
+            "error": "این بخش به صورت موقت غیر فعال شده است"
+        }), 503
+
     username = get_jwt_identity()
     try:
         payload = profile_service.get_referral_summary(username=username)

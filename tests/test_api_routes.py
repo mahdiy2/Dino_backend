@@ -1971,6 +1971,380 @@ class TestApiRoutes(unittest.TestCase):
         media = list_resp.get_json()["posts"][0]["media"][0]
         self.assertTrue(media["mime_type"].startswith("audio/"))
 
+    def test_posts_feed_music_mode_returns_only_music_posts(self):
+        self._register("alice")
+        headers = self._auth_header("alice")
+
+        class FakeMinio:
+            def bucket_exists(self, *args, **kwargs):
+                return True
+
+            def put_object(self, **kwargs):
+                return None
+
+        self.assertEqual(
+            self.client.post(
+                "/api/posts",
+                json={"text": "plain post"},
+                headers=headers,
+            ).status_code,
+            201,
+        )
+
+        with patch("app.services.post_service.get_minio_client", return_value=FakeMinio()):
+            first_music_resp = self.client.post(
+                "/api/posts",
+                data={
+                    "text": "",
+                    "media": (io.BytesIO(b"music-1"), "lofi-one.mp3", "audio/mpeg"),
+                },
+                headers=headers,
+                content_type="multipart/form-data",
+            )
+            second_music_resp = self.client.post(
+                "/api/posts",
+                data={
+                    "text": "",
+                    "media": (io.BytesIO(b"music-2"), "lofi-two.mp3", "audio/mpeg"),
+                },
+                headers=headers,
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(first_music_resp.status_code, 201)
+        self.assertEqual(second_music_resp.status_code, 201)
+        first_music_id = first_music_resp.get_json()["post_id"]
+        second_music_id = second_music_resp.get_json()["post_id"]
+
+        feed_resp = self.client.get("/api/posts/feed?mode=music&limit=10", headers=headers)
+        self.assertEqual(feed_resp.status_code, 200)
+        posts = feed_resp.get_json()["posts"]
+        self.assertEqual(len(posts), 2)
+        self.assertEqual([item["id"] for item in posts], [second_music_id, first_music_id])
+        self.assertTrue(
+            all(
+                any(media["mime_type"].startswith("audio/") for media in post["media"])
+                for post in posts
+            )
+        )
+
+    def test_posts_feed_followers_mode_requires_authentication(self):
+        response = self.client.get("/api/posts/feed?mode=followers")
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("Authentication required", response.get_json()["error"])
+
+    def test_posts_feed_followers_mode_returns_only_followed_authors(self):
+        self._register("alice")
+        self._register("bob")
+        self._register("charlie")
+        alice_headers = self._auth_header("alice")
+        bob_headers = self._auth_header("bob")
+        charlie_headers = self._auth_header("charlie")
+
+        self.assertEqual(
+            self.client.post(
+                "/api/follows/alice",
+                headers=charlie_headers,
+            ).status_code,
+            200,
+        )
+
+        self.assertEqual(
+            self.client.post(
+                "/api/posts",
+                json={"text": "alice note"},
+                headers=alice_headers,
+            ).status_code,
+            201,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/posts",
+                json={"text": "bob note"},
+                headers=bob_headers,
+            ).status_code,
+            201,
+        )
+
+        feed_resp = self.client.get("/api/posts/feed?mode=followers&limit=10", headers=charlie_headers)
+        self.assertEqual(feed_resp.status_code, 200)
+        posts = feed_resp.get_json()["posts"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["author"]["username"], "alice")
+
+    def test_posts_feed_mixed_mode_enforces_ratio_ranking_and_cursor(self):
+        self._register("alice")
+        self._register("bob")
+        self._register("charlie")
+        alice_headers = self._auth_header("alice")
+        bob_headers = self._auth_header("bob")
+        charlie_headers = self._auth_header("charlie")
+
+        for index in range(12):
+            response = self.client.post(
+                "/api/posts",
+                json={"text": f"normal-{index}"},
+                headers=alice_headers,
+            )
+            self.assertEqual(response.status_code, 201)
+
+        class FakeMinio:
+            def bucket_exists(self, *args, **kwargs):
+                return True
+
+            def put_object(self, **kwargs):
+                return None
+
+        with patch("app.services.post_service.get_minio_client", return_value=FakeMinio()):
+            for name in ("rank-a.mp3", "rank-b.mp3", "rank-c.mp3", "rank-d.mp3"):
+                response = self.client.post(
+                    "/api/posts",
+                    data={
+                        "text": "",
+                        "media": (io.BytesIO(name.encode("utf-8")), name, "audio/mpeg"),
+                    },
+                    headers=bob_headers,
+                    content_type="multipart/form-data",
+                )
+                self.assertEqual(response.status_code, 201)
+
+        bob_posts = self.client.get("/api/posts", headers=bob_headers).get_json()["posts"]
+        media_by_name = {
+            post["media"][0]["display_name"]: post["media"][0]["id"]
+            for post in bob_posts
+            if post["media"]
+        }
+        self.assertIn("rank-a.mp3", media_by_name)
+        self.assertIn("rank-b.mp3", media_by_name)
+
+        self.assertEqual(
+            self.client.post(
+                "/api/playlists/tracks",
+                headers=alice_headers,
+                json={"media_id": media_by_name["rank-a.mp3"]},
+            ).status_code,
+            201,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/playlists/tracks",
+                headers=charlie_headers,
+                json={"media_id": media_by_name["rank-a.mp3"]},
+            ).status_code,
+            201,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/playlists/tracks",
+                headers=alice_headers,
+                json={"media_id": media_by_name["rank-b.mp3"]},
+            ).status_code,
+            201,
+        )
+
+        first_page = self.client.get("/api/posts/feed?mode=mixed&limit=12", headers=alice_headers)
+        self.assertEqual(first_page.status_code, 200)
+        first_body = first_page.get_json()
+        self.assertEqual(first_body["mode"], "mixed")
+        self.assertTrue(first_body["has_more"])
+        self.assertIsNotNone(first_body["next_cursor"])
+        first_posts = first_body["posts"]
+        self.assertEqual(len(first_posts), 12)
+
+        music_items = [item for item in first_posts if any(media["mime_type"].startswith("audio/") for media in item["media"])]
+        self.assertEqual(len(music_items), 2)
+        selected_names = {
+            item["media"][0]["display_name"]
+            for item in music_items
+        }
+        self.assertEqual(selected_names, {"rank-a.mp3", "rank-b.mp3"})
+
+        music_positions = [
+            idx
+            for idx, item in enumerate(first_posts)
+            if any(media["mime_type"].startswith("audio/") for media in item["media"])
+        ]
+        self.assertGreater(music_positions[1] - music_positions[0], 1)
+
+        second_page = self.client.get(
+            f"/api/posts/feed?mode=mixed&limit=12&cursor={first_body['next_cursor']}",
+            headers=alice_headers,
+        )
+        self.assertEqual(second_page.status_code, 200)
+        second_posts = second_page.get_json()["posts"]
+        self.assertTrue(second_posts)
+
+        first_ids = {item["id"] for item in first_posts}
+        second_ids = {item["id"] for item in second_posts}
+        self.assertTrue(first_ids.isdisjoint(second_ids))
+
+    def test_posts_feed_mixed_mode_ranks_music_by_last_24h_playlist_adds(self):
+        self._register("alice")
+        self._register("bob")
+        self._register("charlie")
+        self._register("david")
+        self._register("eve")
+
+        alice_headers = self._auth_header("alice")
+        bob_headers = self._auth_header("bob")
+        charlie_headers = self._auth_header("charlie")
+        david_headers = self._auth_header("david")
+        eve_headers = self._auth_header("eve")
+
+        for index in range(7):
+            response = self.client.post(
+                "/api/posts",
+                json={"text": f"normal-last24-{index}"},
+                headers=alice_headers,
+            )
+            self.assertEqual(response.status_code, 201)
+
+        class FakeMinio:
+            def bucket_exists(self, *args, **kwargs):
+                return True
+
+            def put_object(self, **kwargs):
+                return None
+
+        with patch("app.services.post_service.get_minio_client", return_value=FakeMinio()):
+            fresh_music_resp = self.client.post(
+                "/api/posts",
+                data={
+                    "text": "",
+                    "media": (io.BytesIO(b"fresh"), "fresh-trending.mp3", "audio/mpeg"),
+                },
+                headers=bob_headers,
+                content_type="multipart/form-data",
+            )
+            old_music_resp = self.client.post(
+                "/api/posts",
+                data={
+                    "text": "",
+                    "media": (io.BytesIO(b"old"), "old-alltime.mp3", "audio/mpeg"),
+                },
+                headers=bob_headers,
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(fresh_music_resp.status_code, 201)
+        self.assertEqual(old_music_resp.status_code, 201)
+
+        bob_posts = self.client.get("/api/posts", headers=bob_headers).get_json()["posts"]
+        media_by_name = {
+            post["media"][0]["display_name"]: post["media"][0]["id"]
+            for post in bob_posts
+            if post["media"]
+        }
+        old_media_id = media_by_name["old-alltime.mp3"]
+        fresh_media_id = media_by_name["fresh-trending.mp3"]
+
+        for headers in (charlie_headers, david_headers, eve_headers):
+            response = self.client.post(
+                "/api/playlists/tracks",
+                headers=headers,
+                json={"media_id": old_media_id},
+            )
+            self.assertEqual(response.status_code, 201)
+
+        with self.app.app_context():
+            from app.models.playlist_track_model import PlaylistTrack
+
+            stale_time = datetime.utcnow() - timedelta(days=2)
+            old_rows = PlaylistTrack.query.filter_by(media_id=old_media_id).all()
+            self.assertTrue(old_rows)
+            for row in old_rows:
+                row.created_at = stale_time
+            self.db.session.commit()
+
+        for headers in (charlie_headers, david_headers):
+            response = self.client.post(
+                "/api/playlists/tracks",
+                headers=headers,
+                json={"media_id": fresh_media_id},
+            )
+            self.assertEqual(response.status_code, 201)
+
+        feed_resp = self.client.get("/api/posts/feed?mode=mixed&limit=6", headers=alice_headers)
+        self.assertEqual(feed_resp.status_code, 200)
+        feed_posts = feed_resp.get_json()["posts"]
+
+        music_items = [
+            item
+            for item in feed_posts
+            if any(media["mime_type"].startswith("audio/") for media in item["media"])
+        ]
+        self.assertEqual(len(music_items), 1)
+        self.assertEqual(
+            music_items[0]["media"][0]["display_name"],
+            "fresh-trending.mp3",
+        )
+
+    def test_posts_feed_followers_mode_enforces_music_ratio_without_clustering(self):
+        self._register("alice")
+        self._register("bob")
+        self._register("charlie")
+        self._register("viewer")
+        alice_headers = self._auth_header("alice")
+        bob_headers = self._auth_header("bob")
+        viewer_headers = self._auth_header("viewer")
+
+        self.assertEqual(
+            self.client.post("/api/follows/alice", headers=viewer_headers).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post("/api/follows/bob", headers=viewer_headers).status_code,
+            200,
+        )
+
+        for index in range(12):
+            response = self.client.post(
+                "/api/posts",
+                json={"text": f"followers-normal-{index}"},
+                headers=alice_headers,
+            )
+            self.assertEqual(response.status_code, 201)
+
+        class FakeMinio:
+            def bucket_exists(self, *args, **kwargs):
+                return True
+
+            def put_object(self, **kwargs):
+                return None
+
+        with patch("app.services.post_service.get_minio_client", return_value=FakeMinio()):
+            for name in ("followers-m1.mp3", "followers-m2.mp3", "followers-m3.mp3", "followers-m4.mp3"):
+                response = self.client.post(
+                    "/api/posts",
+                    data={
+                        "text": "",
+                        "media": (io.BytesIO(name.encode("utf-8")), name, "audio/mpeg"),
+                    },
+                    headers=bob_headers,
+                    content_type="multipart/form-data",
+                )
+                self.assertEqual(response.status_code, 201)
+
+        feed_resp = self.client.get(
+            "/api/posts/feed?mode=followers&limit=12",
+            headers=viewer_headers,
+        )
+        self.assertEqual(feed_resp.status_code, 200)
+        posts = feed_resp.get_json()["posts"]
+        self.assertEqual(len(posts), 12)
+
+        music_positions = [
+            index
+            for index, post in enumerate(posts)
+            if any(media["mime_type"].startswith("audio/") for media in post["media"])
+        ]
+        self.assertLessEqual(len(music_positions), 2)
+        if len(music_positions) > 1:
+            self.assertGreater(music_positions[1] - music_positions[0], 1)
+
+        for post in posts:
+            self.assertIn(post["author"]["username"], {"alice", "bob"})
+
     def test_create_post_ignores_legacy_upload_lock_key(self):
         self._register("alice")
         headers = self._auth_header("alice")

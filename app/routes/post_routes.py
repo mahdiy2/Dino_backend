@@ -4,6 +4,7 @@ from app.services.post_service import (
     ConcurrentPostUploadError,
     MediaStorageError,
     create_post_with_media,
+    get_feed,
     get_post,
     delete_post_by_username,
     get_posts,
@@ -50,6 +51,26 @@ def _parse_include_total(value):
             return False
 
     raise ValueError("include_total must be a boolean")
+
+
+def _parse_music_filter(value):
+    if value is None:
+        return False
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+
+    raise ValueError("music_filter must be a boolean")
 
 
 def _parse_optional_post_id(value):
@@ -210,6 +231,34 @@ def list_posts():
         include_total=include_total,
     )
     return jsonify(data), 200
+
+
+@post_bp.route("/posts/feed", methods=["GET"])
+@jwt_required(optional=True)
+def list_feed():
+    viewer_username = get_jwt_identity()
+    limit = request.args.get("limit", default=20, type=int)
+    mode = request.args.get("mode")
+    cursor = request.args.get("cursor")
+
+    try:
+        music_filter = _parse_music_filter(request.args.get("music_filter"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    try:
+        payload = get_feed(
+            limit=limit,
+            mode=mode,
+            cursor=cursor,
+            viewer_username=viewer_username,
+            music_filter=music_filter,
+        )
+        return jsonify(payload), 200
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 401
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
 
 @post_bp.route("/posts/<int:post_id>", methods=["GET"])

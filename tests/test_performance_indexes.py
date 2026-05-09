@@ -36,6 +36,7 @@ class TestPerformanceIndexes(unittest.TestCase):
             "ix_activity_notifications_recipient_unread_created",
             names,
         )
+        self.assertIn("ix_playlist_tracks_created_media", names)
         self.assertIn("ix_follows_following_follower", names)
         self.assertIn("ix_blocks_blocked_blocker", names)
         self.assertIn("ix_group_members_user_group", names)

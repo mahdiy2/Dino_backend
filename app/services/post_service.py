@@ -2,9 +2,13 @@ import os
 import uuid
 import time
 import mimetypes
+import base64
+import json
+import math
+from datetime import datetime, timedelta, timezone
 from flask import current_app, has_app_context, has_request_context, request
 from minio.error import S3Error
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import selectinload
 
 from app.extensions import redis_client as redis_backend
@@ -43,6 +47,19 @@ POST_UPLOAD_IDEMPOTENCY_RESULT_TTL_SECONDS = 24 * 60 * 60
 POST_UPLOAD_IDEMPOTENCY_PROCESSING_TTL_SECONDS = 30 * 60
 POST_UPLOAD_IDEMPOTENCY_WAIT_SECONDS = 15.0
 POST_UPLOAD_IDEMPOTENCY_POLL_INTERVAL_SECONDS = 0.25
+FEED_MODE_MIXED = "mixed"
+FEED_MODE_MUSIC = "music"
+FEED_MODE_FOLLOWERS = "followers"
+MUSIC_RANKING_WINDOW_HOURS = 24
+FEED_MODE_ALIASES = {
+    FEED_MODE_MIXED: FEED_MODE_MIXED,
+    "global": FEED_MODE_MIXED,
+    "all": FEED_MODE_MIXED,
+    FEED_MODE_MUSIC: FEED_MODE_MUSIC,
+    "music_only": FEED_MODE_MUSIC,
+    FEED_MODE_FOLLOWERS: FEED_MODE_FOLLOWERS,
+    "followers_only": FEED_MODE_FOLLOWERS,
+}
 
 
 class MediaStorageError(Exception):
@@ -1027,6 +1044,546 @@ def create_post_with_media(
         return {"post_id": post.id}
     finally:
         _release_post_idempotency_lock(idempotency_lock_handle)
+
+
+def _serialize_datetime_for_cursor(value: datetime) -> str:
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value.isoformat(timespec="microseconds")
+
+
+def _parse_datetime_cursor(value: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("Invalid feed cursor")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("Invalid feed cursor")
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _encode_feed_cursor(payload: dict | None) -> str | None:
+    if not payload:
+        return None
+    serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    encoded = base64.urlsafe_b64encode(serialized.encode("utf-8")).decode("ascii")
+    return encoded.rstrip("=")
+
+
+def _decode_feed_cursor(cursor: str | None) -> dict:
+    if not cursor:
+        return {}
+
+    if not isinstance(cursor, str):
+        raise ValueError("Invalid feed cursor")
+
+    normalized = cursor.strip()
+    if not normalized:
+        return {}
+
+    padding = "=" * (-len(normalized) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(normalized + padding).decode("utf-8")
+        payload = json.loads(decoded)
+    except Exception as exc:
+        raise ValueError("Invalid feed cursor") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid feed cursor")
+    return payload
+
+
+def _normalize_feed_mode(mode: str | None, *, music_filter: bool = False) -> str:
+    if music_filter:
+        return FEED_MODE_MUSIC
+
+    candidate = (mode or FEED_MODE_MIXED).strip().lower()
+    normalized = FEED_MODE_ALIASES.get(candidate)
+    if normalized is None:
+        raise ValueError("mode must be one of: mixed, music, followers")
+    return normalized
+
+
+def _music_post_exists_filter():
+    return (
+        db.session.query(Media.id)
+        .filter(
+            Media.post_id == Post.id,
+            Media.mime_type.like("audio/%"),
+        )
+        .exists()
+    )
+
+
+def _apply_chronological_cursor(query, cursor_payload: dict | None):
+    if not cursor_payload:
+        return query
+
+    try:
+        cursor_id = int(cursor_payload["id"])
+        cursor_created_at = _parse_datetime_cursor(cursor_payload["created_at"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Invalid feed cursor") from exc
+
+    return query.filter(
+        or_(
+            Post.created_at < cursor_created_at,
+            and_(
+                Post.created_at == cursor_created_at,
+                Post.id < cursor_id,
+            ),
+        )
+    )
+
+
+def _load_posts_in_order(post_ids: list[int]):
+    if not post_ids:
+        return []
+
+    posts = (
+        Post.query
+        .filter(Post.id.in_(post_ids))
+        .options(selectinload(Post.media))
+        .all()
+    )
+    posts_by_id = {post.id: post for post in posts}
+    return [posts_by_id[post_id] for post_id in post_ids if post_id in posts_by_id]
+
+
+def _fetch_posts_chronological(
+    *,
+    limit: int,
+    viewer_user_id: int | None,
+    hidden_user_ids: set[int],
+    cursor_payload: dict | None = None,
+    music_filter: bool | None = None,
+    author_ids_subquery=None,
+):
+    filter_conditions = [
+        Post.is_hidden.is_(False),
+        User.is_suspended.is_(False),
+        _post_visibility_filter(viewer_user_id),
+    ]
+    if hidden_user_ids:
+        filter_conditions.append(~Post.author_id.in_(hidden_user_ids))
+    if author_ids_subquery is not None:
+        filter_conditions.append(Post.author_id.in_(author_ids_subquery))
+
+    music_exists = _music_post_exists_filter()
+    if music_filter is True:
+        filter_conditions.append(music_exists)
+    elif music_filter is False:
+        filter_conditions.append(~music_exists)
+
+    query = (
+        db.session.query(Post.id)
+        .join(User, User.id == Post.author_id)
+        .filter(*filter_conditions)
+        .order_by(Post.created_at.desc(), Post.id.desc())
+    )
+    query = _apply_chronological_cursor(query, cursor_payload)
+
+    post_ids = [row[0] for row in query.limit(limit).all()]
+    posts = _load_posts_in_order(post_ids)
+    return posts
+
+
+def _apply_ranked_music_cursor(query, cursor_payload: dict | None, playlist_count_expr):
+    if not cursor_payload:
+        return query
+
+    try:
+        cursor_id = int(cursor_payload["id"])
+        cursor_created_at = _parse_datetime_cursor(cursor_payload["created_at"])
+        cursor_playlist_count = int(
+            cursor_payload.get(
+                "playlist_count_24h",
+                cursor_payload["playlist_count"],
+            )
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Invalid feed cursor") from exc
+
+    return query.filter(
+        or_(
+            playlist_count_expr < cursor_playlist_count,
+            and_(
+                playlist_count_expr == cursor_playlist_count,
+                Post.created_at < cursor_created_at,
+            ),
+            and_(
+                playlist_count_expr == cursor_playlist_count,
+                Post.created_at == cursor_created_at,
+                Post.id < cursor_id,
+            ),
+        )
+    )
+
+
+def _fetch_music_posts_ranked(
+    *,
+    limit: int,
+    viewer_user_id: int | None,
+    hidden_user_ids: set[int],
+    cursor_payload: dict | None = None,
+    author_ids_subquery=None,
+):
+    rank_window_start = datetime.utcnow() - timedelta(hours=MUSIC_RANKING_WINDOW_HOURS)
+    playlist_counts_subquery = (
+        db.session.query(
+            Media.post_id.label("post_id"),
+            func.count(PlaylistTrack.id).label("playlist_count_24h"),
+        )
+        .join(Media, Media.id == PlaylistTrack.media_id)
+        .filter(PlaylistTrack.created_at >= rank_window_start)
+        .group_by(Media.post_id)
+        .subquery()
+    )
+
+    playlist_count_expr = func.coalesce(
+        playlist_counts_subquery.c.playlist_count_24h,
+        0,
+    )
+    filter_conditions = [
+        Post.is_hidden.is_(False),
+        User.is_suspended.is_(False),
+        _post_visibility_filter(viewer_user_id),
+        _music_post_exists_filter(),
+    ]
+    if hidden_user_ids:
+        filter_conditions.append(~Post.author_id.in_(hidden_user_ids))
+    if author_ids_subquery is not None:
+        filter_conditions.append(Post.author_id.in_(author_ids_subquery))
+
+    query = (
+        db.session.query(
+            Post.id,
+            Post.created_at,
+            playlist_count_expr.label("playlist_count_24h"),
+        )
+        .join(User, User.id == Post.author_id)
+        .outerjoin(
+            playlist_counts_subquery,
+            playlist_counts_subquery.c.post_id == Post.id,
+        )
+        .filter(*filter_conditions)
+    )
+    query = _apply_ranked_music_cursor(query, cursor_payload, playlist_count_expr)
+    rows = (
+        query
+        .order_by(
+            playlist_count_expr.desc(),
+            Post.created_at.desc(),
+            Post.id.desc(),
+        )
+        .limit(limit)
+        .all()
+    )
+
+    post_ids = [row.id for row in rows]
+    posts = _load_posts_in_order(post_ids)
+    posts_by_id = {post.id: post for post in posts}
+    ranked_items = []
+    for row in rows:
+        post = posts_by_id.get(row.id)
+        if post is None:
+            continue
+        ranked_items.append(
+            {
+                "post": post,
+                "playlist_count_24h": int(row.playlist_count_24h or 0),
+            }
+        )
+    return ranked_items
+
+
+def _build_chronological_cursor_payload(post: Post) -> dict:
+    return {
+        "id": int(post.id),
+        "created_at": _serialize_datetime_for_cursor(post.created_at),
+    }
+
+
+def _build_ranked_music_cursor_payload(ranked_item: dict) -> dict:
+    post = ranked_item["post"]
+    playlist_count_24h = int(
+        ranked_item.get(
+            "playlist_count_24h",
+            ranked_item.get("playlist_count", 0),
+        )
+    )
+    return {
+        "id": int(post.id),
+        "created_at": _serialize_datetime_for_cursor(post.created_at),
+        "playlist_count_24h": playlist_count_24h,
+        "playlist_count": playlist_count_24h,
+    }
+
+
+def _max_music_slots_for_normals(normal_count: int) -> int:
+    if normal_count <= 0:
+        return 0
+    return int(math.floor((normal_count * 2) / 10))
+
+
+def _interleave_music_posts(normal_posts: list[Post], music_posts: list[Post]):
+    if not music_posts:
+        return normal_posts
+    if not normal_posts:
+        return music_posts
+
+    total_normals = len(normal_posts)
+    total_music = len(music_posts)
+    insertion_points = [
+        ((slot + 1) * (total_normals + 1)) // (total_music + 1)
+        for slot in range(total_music)
+    ]
+
+    merged = []
+    music_index = 0
+    for normal_index, post in enumerate(normal_posts, start=1):
+        merged.append(post)
+        while (
+            music_index < total_music
+            and insertion_points[music_index] == normal_index
+        ):
+            merged.append(music_posts[music_index])
+            music_index += 1
+
+    while music_index < total_music:
+        merged.append(music_posts[music_index])
+        music_index += 1
+    return merged
+
+
+def _build_ratio_feed_page(
+    *,
+    limit: int,
+    viewer_user_id: int | None,
+    hidden_user_ids: set[int],
+    normal_cursor_payload: dict | None = None,
+    music_cursor_payload: dict | None = None,
+    author_ids_subquery=None,
+):
+    music_slot_budget = limit // 6
+    normal_target = max(1, limit - music_slot_budget)
+    normal_posts_with_lookahead = _fetch_posts_chronological(
+        limit=normal_target + 1,
+        viewer_user_id=viewer_user_id,
+        hidden_user_ids=hidden_user_ids,
+        cursor_payload=normal_cursor_payload,
+        music_filter=False,
+        author_ids_subquery=author_ids_subquery,
+    )
+    normal_has_more = len(normal_posts_with_lookahead) > normal_target
+    normal_posts = normal_posts_with_lookahead[:normal_target]
+
+    if not normal_posts:
+        ranked_music = _fetch_music_posts_ranked(
+            limit=limit + 1,
+            viewer_user_id=viewer_user_id,
+            hidden_user_ids=hidden_user_ids,
+            cursor_payload=music_cursor_payload,
+            author_ids_subquery=author_ids_subquery,
+        )
+        has_more = len(ranked_music) > limit
+        page_music = ranked_music[:limit]
+        page_posts = [item["post"] for item in page_music]
+
+        next_cursor = None
+        if has_more and page_music:
+            next_cursor = {
+                "music": _build_ranked_music_cursor_payload(page_music[-1])
+            }
+        return page_posts, has_more, next_cursor
+
+    max_music_slots = _max_music_slots_for_normals(len(normal_posts))
+    max_music_slots = min(
+        max_music_slots,
+        music_slot_budget,
+        max(0, limit - len(normal_posts)),
+    )
+
+    ranked_music = []
+    music_has_more = False
+    if max_music_slots > 0:
+        ranked_music_with_lookahead = _fetch_music_posts_ranked(
+            limit=max_music_slots + 1,
+            viewer_user_id=viewer_user_id,
+            hidden_user_ids=hidden_user_ids,
+            cursor_payload=music_cursor_payload,
+            author_ids_subquery=author_ids_subquery,
+        )
+        music_has_more = len(ranked_music_with_lookahead) > max_music_slots
+        ranked_music = ranked_music_with_lookahead[:max_music_slots]
+
+    merged_posts = _interleave_music_posts(
+        normal_posts,
+        [item["post"] for item in ranked_music],
+    )
+    page_posts = merged_posts[:limit]
+    has_more = normal_has_more or music_has_more
+
+    if not has_more and not normal_has_more and max_music_slots == 0:
+        music_probe = _fetch_music_posts_ranked(
+            limit=1,
+            viewer_user_id=viewer_user_id,
+            hidden_user_ids=hidden_user_ids,
+            cursor_payload=music_cursor_payload,
+            author_ids_subquery=author_ids_subquery,
+        )
+        has_more = bool(music_probe)
+
+    if not has_more:
+        return page_posts, False, None
+
+    next_cursor = {
+        "normal": _build_chronological_cursor_payload(normal_posts[-1]),
+    }
+    if ranked_music:
+        next_cursor["music"] = _build_ranked_music_cursor_payload(ranked_music[-1])
+    elif music_cursor_payload:
+        next_cursor["music"] = music_cursor_payload
+    return page_posts, True, next_cursor
+
+
+def _serialize_feed_posts(
+    ordered_posts: list[Post],
+    *,
+    viewer_user_id: int | None,
+    hidden_user_ids: set[int],
+):
+    if not ordered_posts:
+        return []
+
+    quoted_posts_by_id = _build_visible_quoted_posts(
+        ordered_posts,
+        viewer_user_id=viewer_user_id,
+        hidden_user_ids=hidden_user_ids,
+    )
+    author_ids = {
+        post.author_id
+        for post in ordered_posts
+    } | {
+        quoted_post.author_id
+        for quoted_post in quoted_posts_by_id.values()
+    }
+    post_ids = {post.id for post in ordered_posts}
+    user_by_id, profile_by_user_id = _build_author_maps(author_ids)
+    playlist_adders_by_media_id = _build_playlist_adders_by_media(ordered_posts)
+    vote_by_post_id = _build_vote_map(
+        post_ids=post_ids,
+        viewer_user_id=viewer_user_id,
+    )
+
+    serialized_posts = []
+    for post in ordered_posts:
+        payload = _serialize_post(
+            post,
+            user_by_id,
+            profile_by_user_id,
+            playlist_adders_by_media_id=playlist_adders_by_media_id,
+            quoted_posts_by_id=quoted_posts_by_id,
+        )
+        payload["viewer_vote"] = int(vote_by_post_id.get(post.id, 0))
+        serialized_posts.append(payload)
+    return serialized_posts
+
+
+def get_feed(
+    *,
+    limit: int,
+    mode: str | None = None,
+    cursor: str | None = None,
+    viewer_username: str | None = None,
+    music_filter: bool = False,
+):
+    limit = max(1, min(int(limit or 20), 50))
+    feed_mode = _normalize_feed_mode(mode, music_filter=music_filter)
+    cursor_payload = _decode_feed_cursor(cursor)
+
+    cursor_mode = cursor_payload.get("mode")
+    if cursor_mode and cursor_mode != feed_mode:
+        raise ValueError("Invalid feed cursor")
+
+    viewer_user_id = _viewer_user_id(viewer_username)
+    if feed_mode == FEED_MODE_FOLLOWERS and viewer_user_id is None:
+        raise PermissionError("Authentication required for followers feed")
+
+    hidden_user_ids = block_service.hidden_user_ids_for_viewer(viewer_username)
+
+    next_cursor_payload = {"mode": feed_mode}
+    has_more = False
+
+    if feed_mode == FEED_MODE_MUSIC:
+        music_posts = _fetch_posts_chronological(
+            limit=limit + 1,
+            viewer_user_id=viewer_user_id,
+            hidden_user_ids=hidden_user_ids,
+            cursor_payload=cursor_payload.get("primary"),
+            music_filter=True,
+        )
+        has_more = len(music_posts) > limit
+        page_posts = music_posts[:limit]
+        if has_more and page_posts:
+            next_cursor_payload["primary"] = _build_chronological_cursor_payload(
+                page_posts[-1]
+            )
+        else:
+            next_cursor_payload = None
+
+    elif feed_mode == FEED_MODE_FOLLOWERS:
+        following_ids_subquery = (
+            db.session.query(Follow.following_id)
+            .filter(Follow.follower_id == viewer_user_id)
+        )
+        follower_normal_cursor = (
+            cursor_payload.get("normal")
+            or cursor_payload.get("primary")
+        )
+        page_posts, has_more, ratio_next_cursor = _build_ratio_feed_page(
+            limit=limit,
+            viewer_user_id=viewer_user_id,
+            hidden_user_ids=hidden_user_ids,
+            normal_cursor_payload=follower_normal_cursor,
+            music_cursor_payload=cursor_payload.get("music"),
+            author_ids_subquery=following_ids_subquery,
+        )
+        if has_more:
+            next_cursor_payload.update(ratio_next_cursor or {})
+        else:
+            next_cursor_payload = None
+
+    else:
+        page_posts, has_more, ratio_next_cursor = _build_ratio_feed_page(
+            limit=limit,
+            viewer_user_id=viewer_user_id,
+            hidden_user_ids=hidden_user_ids,
+            normal_cursor_payload=cursor_payload.get("normal"),
+            music_cursor_payload=cursor_payload.get("music"),
+        )
+        if has_more:
+            next_cursor_payload.update(ratio_next_cursor or {})
+        else:
+            next_cursor_payload = None
+
+    serialized_posts = _serialize_feed_posts(
+        page_posts,
+        viewer_user_id=viewer_user_id,
+        hidden_user_ids=hidden_user_ids,
+    )
+
+    return {
+        "mode": feed_mode,
+        "limit": limit,
+        "has_more": bool(has_more),
+        "next_cursor": _encode_feed_cursor(next_cursor_payload) if has_more else None,
+        "posts": serialized_posts,
+    }
 
 
 def get_posts(

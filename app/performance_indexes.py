@@ -91,9 +91,24 @@ MANAGED_INDEX_SPECS: tuple[IndexSpec, ...] = (
         ddl_target="media (post_id)",
     ),
     IndexSpec(
+        table_name="media",
+        index_name="ix_media_post_mime",
+        ddl_target="media (post_id, mime_type)",
+    ),
+    IndexSpec(
         table_name="playlist_tracks",
         index_name="ix_playlist_tracks_user_created",
         ddl_target="playlist_tracks (user_id, created_at, id)",
+    ),
+    IndexSpec(
+        table_name="playlist_tracks",
+        index_name="ix_playlist_tracks_media_created",
+        ddl_target="playlist_tracks (media_id, created_at, id)",
+    ),
+    IndexSpec(
+        table_name="playlist_tracks",
+        index_name="ix_playlist_tracks_created_media",
+        ddl_target="playlist_tracks (created_at, media_id)",
     ),
     IndexSpec(
         table_name="activity_notifications",
