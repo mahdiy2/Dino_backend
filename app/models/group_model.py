@@ -8,6 +8,9 @@ class Group(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(120), nullable=False)
+    room_key = db.Column(db.String(64), nullable=True, unique=True, index=True)
+    is_public_room = db.Column(db.Boolean, nullable=False, default=False, index=True)
+    message_ttl_seconds = db.Column(db.Integer, nullable=True)
     creator_id = db.Column(
         db.Integer,
         db.ForeignKey("users.id", ondelete="CASCADE"),
@@ -29,6 +32,9 @@ class Group(db.Model):
         return {
             "id": self.id,
             "name": self.name,
+            "room_key": self.room_key,
+            "is_public_room": bool(self.is_public_room),
+            "message_ttl_seconds": self.message_ttl_seconds,
             "creator_id": self.creator_id,
             "created_at": self.created_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         }

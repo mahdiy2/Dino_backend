@@ -178,6 +178,115 @@ class TestSocketMessageFlow(unittest.TestCase):
             self.db.session.commit()
             return group.id
 
+    def _create_public_room(self, name="Public Room"):
+        with self.app.app_context():
+            from app.models.group_model import Group, GroupMember
+            from app.models.user_model import User
+
+            creator = User.query.filter_by(username="alice").first()
+            member = User.query.filter_by(username="bob").first()
+            self.assertIsNotNone(creator)
+            self.assertIsNotNone(member)
+
+            group = Group(
+                name=name,
+                creator_id=creator.id,
+                room_key="global_public_room",
+                is_public_room=True,
+                message_ttl_seconds=1800,
+            )
+            self.db.session.add(group)
+            self.db.session.flush()
+            self.db.session.add(GroupMember(group_id=group.id, user_id=creator.id))
+            self.db.session.add(GroupMember(group_id=group.id, user_id=member.id))
+            self.db.session.commit()
+            return group.id
+
+    def test_public_room_group_send_allows_plaintext_without_encrypted_keys(self):
+        group_id = self._create_public_room()
+        alice = self._connect(self.alice_token)
+        bob = self._connect(self.bob_token)
+        alice.get_received()
+        bob.get_received()
+
+        alice.emit("join_group", {"group_id": group_id})
+        bob.emit("join_group", {"group_id": group_id})
+        alice.get_received()
+        bob.get_received()
+
+        self._emit_group_message(
+            alice,
+            {
+                "group_id": group_id,
+                "message": "hello public room",
+                "type": "text",
+            },
+        )
+
+        alice_events = alice.get_received()
+        bob_events = bob.get_received()
+        sent_events = [event for event in alice_events if event["name"] == "group_message_sent"]
+        self.assertEqual(len(sent_events), 1)
+
+        new_group_events = [event for event in bob_events if event["name"] == "new_group_message"]
+        self.assertEqual(len(new_group_events), 1)
+        payload = new_group_events[0]["args"][0]
+        self.assertEqual(payload.get("message"), "hello public room")
+        self.assertEqual(payload.get("encryption_mode"), "none")
+        self.assertIn("expires_at", payload)
+        self.assertFalse(bool(payload.get("encrypted_key")))
+
+    def test_public_room_message_expiry_deletes_message_for_everyone(self):
+        group_id = self._create_public_room()
+        alice = self._connect(self.alice_token)
+        bob = self._connect(self.bob_token)
+        alice.get_received()
+        bob.get_received()
+
+        alice.emit("join_group", {"group_id": group_id})
+        bob.emit("join_group", {"group_id": group_id})
+        alice.get_received()
+        bob.get_received()
+
+        self._emit_group_message(
+            alice,
+            {
+                "group_id": group_id,
+                "message": "expires soon",
+                "type": "text",
+            },
+        )
+        alice_events = alice.get_received()
+        message_id = None
+        for event in alice_events:
+            if event["name"] == "group_message_sent":
+                message_id = event["args"][0].get("message_id")
+                break
+        self.assertTrue(message_id)
+
+        with self.app.app_context():
+            from app.services import public_room_message_expiry_service
+
+            expired = public_room_message_expiry_service.expire_public_room_message(
+                group_id=group_id,
+                message_id=message_id,
+            )
+            self.assertTrue(expired)
+
+        alice_after = alice.get_received()
+        bob_after = bob.get_received()
+        alice_deleted = [event for event in alice_after if event["name"] == "group_message_deleted"]
+        bob_deleted = [event for event in bob_after if event["name"] == "group_message_deleted"]
+        self.assertGreaterEqual(len(alice_deleted), 1)
+        self.assertGreaterEqual(len(bob_deleted), 1)
+
+        with self.app.app_context():
+            from app.models.chat_message_model import GroupMessage
+
+            row = GroupMessage.query.filter_by(message_id=message_id).first()
+            self.assertIsNotNone(row)
+            self.assertTrue(row.deleted_for_everyone)
+
     def test_online_recipient_receives_live_message(self):
         alice = self._connect(self.alice_token)
         bob = self._connect(self.bob_token)
@@ -1103,6 +1212,17 @@ class TestSocketMessageFlow(unittest.TestCase):
         self.assertEqual(len(read_sync_events), 1)
         self.assertEqual(read_sync_events[0]["args"][0]["group_id"], group_id)
         self.assertGreaterEqual(read_sync_events[0]["args"][0]["marked"], 1)
+        pending_group_events = [
+            event for event in bob_after_join if event["name"] == "pending_group_messages"
+        ]
+        self.assertEqual(len(pending_group_events), 1)
+        self.assertEqual(pending_group_events[0]["args"][0]["group_id"], group_id)
+        pending_message_ids = [
+            payload.get("message_id")
+            for payload in pending_group_events[0]["args"][0].get("messages", [])
+            if isinstance(payload, dict)
+        ]
+        self.assertIn(message_id, pending_message_ids)
 
         alice_after_join = alice.get_received()
         delivered_status_events = [

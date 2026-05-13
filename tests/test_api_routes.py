@@ -796,6 +796,25 @@ class TestApiRoutes(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.get_json()["error"], "Username already exists")
 
+    def test_admin_can_delete_user_via_account_deletion_service(self):
+        self._register("admin")
+        self._register("alice")
+        self._make_admin("admin")
+        admin_headers = self._auth_header("admin")
+        alice_id = self._user_id("alice")
+
+        response = self.client.delete(
+            f"/admin/api/users/{alice_id}",
+            headers=admin_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["message"], "User deleted")
+
+        with self.app.app_context():
+            from app.models.user_model import User
+
+            self.assertIsNone(User.query.filter_by(username="alice").first())
+
     def test_admin_can_assign_and_clear_user_badge(self):
         self._register("admin")
         self._register("alice")
@@ -3918,6 +3937,105 @@ class TestApiRoutes(unittest.TestCase):
         old_video_object_name = first_video_url.split("/media/", 1)[1]
         removed_object_names = [call["object_name"] for call in fake_minio.remove_calls]
         self.assertIn(old_video_object_name, removed_object_names)
+
+    def test_profile_image_can_be_removed(self):
+        self._register("alice")
+        headers = self._auth_header("alice")
+
+        class FakeMinio:
+            def __init__(self):
+                self.put_calls = []
+                self.remove_calls = []
+
+            def put_object(self, **kwargs):
+                self.put_calls.append(kwargs)
+                return None
+
+            def remove_object(self, **kwargs):
+                self.remove_calls.append(kwargs)
+                return None
+
+        fake_minio = FakeMinio()
+
+        with patch("app.services.profile_service.get_minio_client", return_value=fake_minio):
+            upload_response = self.client.put(
+                "/api/profiles/me",
+                data={
+                    "profile_image": (
+                        io.BytesIO(b"image-data"),
+                        "avatar.webp",
+                        "image/webp",
+                    ),
+                },
+                headers=headers,
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(upload_response.status_code, 200)
+            upload_payload = upload_response.get_json()
+            uploaded_image_url = upload_payload["profile_image_url"]
+            self.assertIn("/media/profiles/1/images/", uploaded_image_url)
+
+            remove_response = self.client.put(
+                "/api/profiles/me",
+                json={"remove_profile_image": True},
+                headers=headers,
+            )
+            self.assertEqual(remove_response.status_code, 200)
+            self.assertIsNone(remove_response.get_json()["profile_image_url"])
+
+        removed_object_names = [call["object_name"] for call in fake_minio.remove_calls]
+        self.assertIn(uploaded_image_url.split("/media/", 1)[1], removed_object_names)
+
+    def test_profile_video_can_be_removed(self):
+        self._register("alice")
+        headers = self._auth_header("alice")
+
+        class FakeMinio:
+            def __init__(self):
+                self.put_calls = []
+                self.remove_calls = []
+
+            def put_object(self, **kwargs):
+                self.put_calls.append(kwargs)
+                return None
+
+            def remove_object(self, **kwargs):
+                self.remove_calls.append(kwargs)
+                return None
+
+        fake_minio = FakeMinio()
+
+        with (
+            patch("app.services.profile_service.get_minio_client", return_value=fake_minio),
+            patch("app.services.profile_service._get_mp4_duration_seconds", return_value=4.0),
+        ):
+            upload_response = self.client.put(
+                "/api/profiles/me",
+                data={
+                    "profile_video": (
+                        io.BytesIO(b"video-data"),
+                        "avatar.mp4",
+                        "video/mp4",
+                    ),
+                },
+                headers=headers,
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(upload_response.status_code, 200)
+            upload_payload = upload_response.get_json()
+            uploaded_video_url = upload_payload["profile_video_url"]
+            self.assertIn("/media/profiles/1/videos/", uploaded_video_url)
+
+            remove_response = self.client.put(
+                "/api/profiles/me",
+                json={"remove_profile_video": True},
+                headers=headers,
+            )
+            self.assertEqual(remove_response.status_code, 200)
+            self.assertIsNone(remove_response.get_json()["profile_video_url"])
+
+        removed_object_names = [call["object_name"] for call in fake_minio.remove_calls]
+        self.assertIn(uploaded_video_url.split("/media/", 1)[1], removed_object_names)
 
     def test_profile_video_duration_limit(self):
         self._register("alice")

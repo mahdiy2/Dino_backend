@@ -40,6 +40,7 @@ from app.services import (
     password_security,
     daily_winner_service,
     story_service,
+    public_room_message_expiry_service,
 )
 
 import app.models.activity_notification_model  # noqa: F401 – register model with SQLAlchemy
@@ -351,6 +352,74 @@ def _ensure_message_idempotency_schema():
             )
         )
 
+    db.session.commit()
+
+
+def _ensure_group_public_room_schema():
+    inspector = inspect(db.engine)
+    if not inspector.has_table("groups"):
+        return
+
+    column_names = {
+        column["name"]
+        for column in inspector.get_columns("groups")
+    }
+    migration_sql = []
+    if "room_key" not in column_names:
+        migration_sql.append(
+            "ALTER TABLE groups ADD COLUMN room_key VARCHAR(64)"
+        )
+    if "is_public_room" not in column_names:
+        migration_sql.append(
+            "ALTER TABLE groups ADD COLUMN is_public_room BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+    if "message_ttl_seconds" not in column_names:
+        migration_sql.append(
+            "ALTER TABLE groups ADD COLUMN message_ttl_seconds INTEGER"
+        )
+
+    if migration_sql:
+        for sql in migration_sql:
+            db.session.execute(text(sql))
+
+    db.session.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_groups_room_key "
+            "ON groups (room_key)"
+        )
+    )
+    db.session.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_groups_is_public_room "
+            "ON groups (is_public_room)"
+        )
+    )
+    db.session.commit()
+
+
+def _ensure_group_message_expiry_schema():
+    inspector = inspect(db.engine)
+    if not inspector.has_table("group_messages"):
+        return
+
+    column_names = {
+        column["name"]
+        for column in inspector.get_columns("group_messages")
+    }
+    if "expires_at" not in column_names:
+        db.session.execute(
+            text(
+                "ALTER TABLE group_messages "
+                "ADD COLUMN expires_at TIMESTAMP"
+            )
+        )
+
+    db.session.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_group_messages_expires_at "
+            "ON group_messages (expires_at)"
+        )
+    )
     db.session.commit()
 
 
@@ -1056,6 +1125,8 @@ def create_app():
         _ensure_about_us_schema()
         _ensure_private_message_sender_cipher_schema()
         _ensure_message_idempotency_schema()
+        _ensure_group_public_room_schema()
+        _ensure_group_message_expiry_schema()
         _ensure_group_recipient_seen_schema()
         _ensure_group_key_fanout_schema()
         _ensure_message_user_delete_schema()
@@ -1075,6 +1146,7 @@ def create_app():
                 "Migrated %s legacy plaintext password records to Argon2id hashes.",
                 migrated_passwords,
             )
+        public_room_message_expiry_service.bootstrap_public_room_message_expirations(app)
 
     if os.getenv("FLASK_RUN_FROM_CLI", "").strip().lower() in {"1", "true"}:
         app.logger.info("Using Flask CLI runtime. For production prefer Gunicorn.")

@@ -1,4 +1,5 @@
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased, joinedload
 
 from app.db import db
@@ -8,6 +9,9 @@ from app.models.user_model import User
 from app.models.profile_model import Profile
 
 GROUP_MEMBERSHIP_VERSION_HASH = "group:membership_versions"
+PUBLIC_ROOM_KEY = "global_public_room"
+PUBLIC_ROOM_DEFAULT_NAME = "Public Room"
+PUBLIC_ROOM_MESSAGE_TTL_SECONDS = 30 * 60
 
 
 def _normalize_group_id(group_id):
@@ -30,7 +34,10 @@ def _decode_redis_int(value, default=0):
 
 
 def count_groups_created_by(user_id: int) -> int:
-    return Group.query.filter_by(creator_id=user_id).count()
+    return Group.query.filter(
+        Group.creator_id == user_id,
+        Group.is_public_room.is_(False),
+    ).count()
 
 
 def create_group(name: str, creator_id: int) -> Group:
@@ -41,6 +48,44 @@ def create_group(name: str, creator_id: int) -> Group:
     member = GroupMember(group_id=group.id, user_id=creator_id)
     db.session.add(member)
     db.session.commit()
+    return group
+
+
+def get_public_room() -> Group | None:
+    return (
+        Group.query.filter(
+            Group.room_key == PUBLIC_ROOM_KEY,
+            Group.is_public_room.is_(True),
+        )
+        .first()
+    )
+
+
+def ensure_public_room(
+    creator_id: int,
+    *,
+    name: str = PUBLIC_ROOM_DEFAULT_NAME,
+) -> Group:
+    existing = get_public_room()
+    if existing is not None:
+        return existing
+
+    group = Group(
+        name=name,
+        creator_id=creator_id,
+        room_key=PUBLIC_ROOM_KEY,
+        is_public_room=True,
+        message_ttl_seconds=PUBLIC_ROOM_MESSAGE_TTL_SECONDS,
+    )
+    db.session.add(group)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        existing = get_public_room()
+        if existing is not None:
+            return existing
+        raise
     return group
 
 
@@ -142,6 +187,23 @@ def clear_membership_version(group_id: int) -> None:
 
 def get_group_by_id(group_id: int) -> Group | None:
     return Group.query.get(group_id)
+
+
+def is_public_room(group_id: int) -> bool:
+    try:
+        normalized_group_id = int(group_id)
+    except (TypeError, ValueError):
+        return False
+    if normalized_group_id <= 0:
+        return False
+    row = (
+        Group.query.with_entities(Group.is_public_room)
+        .filter(Group.id == normalized_group_id)
+        .first()
+    )
+    if row is None:
+        return False
+    return bool(row[0])
 
 
 def get_groups_for_user(user_id: int):

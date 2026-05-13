@@ -8,6 +8,7 @@ from app.repositories.follow_repository import is_following
 
 MAX_GROUP_NAME_LENGTH = 120
 MIN_GROUP_NAME_LENGTH = 1
+PUBLIC_ROOM_NAME = "Public Room"
 
 
 class GroupLimitReachedError(Exception):
@@ -23,6 +24,10 @@ class NotGroupMemberError(Exception):
 
 
 class NotGroupCreatorError(Exception):
+    pass
+
+
+class PublicRoomOperationError(Exception):
     pass
 
 
@@ -216,6 +221,48 @@ def get_user_groups(username: str):
     return result
 
 
+def get_public_room_status(username: str):
+    user = user_repository.get_by_username(username)
+    if not user:
+        raise ValueError("User not found")
+
+    public_room = group_repository.ensure_public_room(
+        creator_id=user.id,
+        name=PUBLIC_ROOM_NAME,
+    )
+    is_member = group_repository.is_member(public_room.id, user.id)
+    formatted = _format_group(public_room)
+    if is_member:
+        unread_count = message_repository.get_group_pending_count(username, public_room.id)
+        formatted["has_unread"] = unread_count > 0
+        formatted["unread_count"] = unread_count
+    else:
+        formatted["has_unread"] = False
+        formatted["unread_count"] = 0
+    return {
+        "group": formatted,
+        "is_member": is_member,
+    }
+
+
+def join_public_room(username: str):
+    user = user_repository.get_by_username(username)
+    if not user:
+        raise ValueError("User not found")
+
+    public_room = group_repository.ensure_public_room(
+        creator_id=user.id,
+        name=PUBLIC_ROOM_NAME,
+    )
+    joined_now = group_repository.add_member(public_room.id, user.id)
+    if joined_now:
+        group_repository.bump_membership_version(public_room.id)
+    return {
+        "group": _format_group(public_room),
+        "joined_now": joined_now,
+    }
+
+
 def get_group_unread_summary(username: str):
     user = user_repository.get_by_username(username)
     if not user:
@@ -285,7 +332,7 @@ def get_group_members(username: str, group_id: int):
         "group_id": group["id"],
         "group_name": group["name"],
         "member_count": group["member_count"],
-        "can_manage_members": group["creator"]["username"] == username,
+        "can_manage_members": (group["creator"]["username"] == username) and (not group.get("is_public_room", False)),
         "members": group["members"],
     }
 
@@ -298,6 +345,9 @@ def add_members_to_group(requester_username: str, group_id: int, target_username
     group = group_repository.get_group_by_id(group_id)
     if not group:
         raise ValueError("Group not found")
+
+    if group.is_public_room:
+        raise PublicRoomOperationError("Public room does not support manual member invites")
 
     if group.creator_id != requester.id:
         raise NotGroupCreatorError("Only the group creator can add members")
@@ -388,6 +438,9 @@ def remove_member_from_group(requester_username: str, group_id: int, target_user
     if not group:
         raise ValueError("Group not found")
 
+    if group.is_public_room and requester.id != target.id:
+        raise PublicRoomOperationError("Public room members cannot remove others")
+
     if requester.id == target.id:
         if group.creator_id == requester.id:
             raise ValueError("Group creator cannot leave the group. Delete the group instead.")
@@ -415,6 +468,9 @@ def delete_group(requester_username: str, group_id: int):
     group = group_repository.get_group_by_id(group_id)
     if not group:
         raise ValueError("Group not found")
+
+    if group.is_public_room:
+        raise PublicRoomOperationError("Public room cannot be deleted")
 
     if group.creator_id != requester.id:
         raise NotGroupCreatorError("Only the group creator can delete the group")
@@ -453,6 +509,9 @@ def _format_group(
     return {
         "id": group.id,
         "name": group.name,
+        "room_key": group.room_key,
+        "is_public_room": bool(group.is_public_room),
+        "message_ttl_seconds": group.message_ttl_seconds,
         "creator": {
             "id": group.creator_id,
             "username": creator_username,

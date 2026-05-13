@@ -110,6 +110,21 @@ def normalize_group_key_ref(group_key_ref):
     return _normalize_group_key_ref(group_key_ref)
 
 
+def _is_plaintext_group_payload(payload):
+    if not isinstance(payload, dict):
+        return False
+    mode = (payload.get("encryption_mode") or "").strip().lower()
+    return mode == "none"
+
+
+def _active_group_message_filter(reference_time=None):
+    now_value = reference_time or _utc_now_naive()
+    return or_(
+        GroupMessage.expires_at.is_(None),
+        GroupMessage.expires_at > now_value,
+    )
+
+
 def _normalize_recipient_key_records(recipient_key_records):
     normalized = {}
     if isinstance(recipient_key_records, dict):
@@ -275,6 +290,7 @@ def _group_message_to_payload(
         "from": row.sender_username,
         "group_id": row.group_id,
         "group_key_ref": row.group_key_ref,
+        "encryption_mode": "none" if row.group_key_ref is None and not encrypted_keys else "e2ee",
         "type": row.message_type or "text",
         "message": row.encrypted_message,
         "encrypted_keys": encrypted_keys,
@@ -282,6 +298,7 @@ def _group_message_to_payload(
         "message_id": row.message_id,
         "client_message_id": row.client_message_id,
         "timestamp": _format_iso_datetime(row.timestamp),
+        "expires_at": _format_iso_datetime(row.expires_at) if row.expires_at else None,
         "reply_to_message_id": row.reply_to_message_id,
         "reply_to_sender": row.reply_to_sender,
         "encrypted_reply_preview": row.encrypted_reply_preview,
@@ -490,6 +507,10 @@ def _upsert_group_message(payload, group_id, *, auto_commit=True):
     row.group_key_ref = _normalize_group_key_ref((payload or {}).get("group_key_ref"))
     row.message_type = (payload or {}).get("type") or "text"
     row.encrypted_message = (payload or {}).get("message")
+    row.expires_at = _parse_optional_iso_datetime((payload or {}).get("expires_at"))
+    plaintext_mode = _is_plaintext_group_payload(payload)
+    if plaintext_mode:
+        row.group_key_ref = None
     if isinstance((payload or {}).get("sender_encrypted_key"), str):
         row.sender_encrypted_key = (payload or {}).get("sender_encrypted_key")
 
@@ -506,7 +527,10 @@ def _upsert_group_message(payload, group_id, *, auto_commit=True):
     existing_keys = _normalize_encrypted_keys_map(
         _deserialize_json(row.encrypted_keys_json)
     )
-    if incoming_keys:
+    if plaintext_mode:
+        row.sender_encrypted_key = None
+        existing_keys = {}
+    elif incoming_keys:
         if row.group_key_ref:
             sender_key = incoming_keys.get(row.sender_username)
             if sender_key:
@@ -2651,20 +2675,29 @@ def build_group_message_payload(
     recipient_key_records=None,
     group_key_ref=None,
     client_message_id=None,
+    expires_at=None,
+    encryption_mode="e2ee",
 ):
     now = datetime.now(timezone.utc)
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond:06d}Z"
     normalized_sender = sender.strip() if isinstance(sender, str) else ""
-    normalized_group_key_ref = _normalize_group_key_ref(group_key_ref) or str(uuid.uuid4())
-    normalized_recipient_keys = _normalize_recipient_key_records(recipient_key_records)
-    if not normalized_recipient_keys:
-        normalized_recipient_keys = _normalize_encrypted_keys_map(encrypted_keys)
-    sender_encrypted_key = normalized_recipient_keys.get(normalized_sender)
+    normalized_encryption_mode = (encryption_mode or "e2ee").strip().lower()
+    plaintext_mode = normalized_encryption_mode == "none"
+    normalized_group_key_ref = None
+    normalized_recipient_keys = {}
+    sender_encrypted_key = None
+    if not plaintext_mode:
+        normalized_group_key_ref = _normalize_group_key_ref(group_key_ref) or str(uuid.uuid4())
+        normalized_recipient_keys = _normalize_recipient_key_records(recipient_key_records)
+        if not normalized_recipient_keys:
+            normalized_recipient_keys = _normalize_encrypted_keys_map(encrypted_keys)
+        sender_encrypted_key = normalized_recipient_keys.get(normalized_sender)
 
     return {
         "from": sender,
         "group_id": group_id,
         "group_key_ref": normalized_group_key_ref,
+        "encryption_mode": "none" if plaintext_mode else "e2ee",
         "type": message_type,
         "message": encrypted_message,
         "encrypted_keys": normalized_recipient_keys,
@@ -2680,6 +2713,7 @@ def build_group_message_payload(
         "message_id": str(uuid.uuid4()),
         "client_message_id": client_message_id,
         "timestamp": ts,
+        "expires_at": expires_at,
         "reply_to_message_id": reply_to_message_id,
         "reply_to_sender": reply_to_sender,
         "encrypted_reply_preview": encrypted_reply_preview,
@@ -2716,7 +2750,7 @@ def _persist_group_message_recipients(group_id, payload, recipients, recipient_k
 
     for username in recipients:
         encrypted_key = recipient_keys.get(username)
-        if not encrypted_key:
+        if (not encrypted_key) and (not _is_plaintext_group_payload(payload)):
             continue
         row = existing_by_username.get(username)
         if row is None:
@@ -2749,15 +2783,20 @@ def push_group_messages_to_members(group_id, recipients, payload):
     if not normalized_recipients:
         return 0
 
+    plaintext_mode = _is_plaintext_group_payload(payload)
     recipient_keys = _resolve_group_recipient_keys(
         payload=payload,
         recipient_usernames=normalized_recipients,
+    ) if not plaintext_mode else {}
+    recipients_with_keys = (
+        normalized_recipients
+        if plaintext_mode
+        else [
+            username
+            for username in normalized_recipients
+            if isinstance(recipient_keys.get(username), str) and recipient_keys.get(username)
+        ]
     )
-    recipients_with_keys = [
-        username
-        for username in normalized_recipients
-        if isinstance(recipient_keys.get(username), str) and recipient_keys.get(username)
-    ]
     if not recipients_with_keys:
         return 0
 
@@ -2782,6 +2821,9 @@ def push_group_messages_to_members(group_id, recipients, payload):
         if recipient_key:
             recipient_payload["encrypted_key"] = recipient_key
             recipient_payload["encrypted_keys"] = {username: recipient_key}
+        elif plaintext_mode:
+            recipient_payload.pop("encrypted_key", None)
+            recipient_payload.pop("encrypted_keys", None)
         data = json.dumps(
             build_group_message_payload_for_recipient(recipient_payload, username)
         )
@@ -2811,18 +2853,23 @@ def build_group_message_payloads_for_recipients(payload, recipients):
     if not normalized_recipients:
         return {}
 
+    plaintext_mode = _is_plaintext_group_payload(payload)
     recipient_keys = _resolve_group_recipient_keys(
         payload=payload,
         recipient_usernames=normalized_recipients,
-    )
+    ) if not plaintext_mode else {}
     payloads = {}
     for username in normalized_recipients:
         recipient_payload = dict(payload or {})
         recipient_key = recipient_keys.get(username)
-        if not recipient_key:
+        if (not recipient_key) and (not plaintext_mode):
             continue
-        recipient_payload["encrypted_key"] = recipient_key
-        recipient_payload["encrypted_keys"] = {username: recipient_key}
+        if recipient_key:
+            recipient_payload["encrypted_key"] = recipient_key
+            recipient_payload["encrypted_keys"] = {username: recipient_key}
+        else:
+            recipient_payload.pop("encrypted_key", None)
+            recipient_payload.pop("encrypted_keys", None)
         payloads[username] = build_group_message_payload_for_recipient(recipient_payload, username)
     return payloads
 
@@ -2900,6 +2947,7 @@ def _query_group_pending_rows(username, group_id, limit=None):
             GroupMessageRecipient.group_id == int(group_id),
             GroupMessageRecipient.delivered_at.is_(None),
             GroupMessage.deleted_for_everyone.is_(False),
+            _active_group_message_filter(),
         )
         .order_by(GroupMessage.timestamp.asc(), GroupMessage.id.asc())
     )
@@ -2980,6 +3028,7 @@ def get_group_pending_count(username, group_id):
             GroupMessageRecipient.group_id == int(group_id),
             GroupMessageRecipient.delivered_at.is_(None),
             GroupMessage.deleted_for_everyone.is_(False),
+            _active_group_message_filter(),
         )
         .count()
     )
@@ -3070,6 +3119,7 @@ def get_group_message_history(group_id, username=None, limit=50, before_timestam
     base_filters = (
         GroupMessage.group_id == int(group_id),
         GroupMessage.deleted_for_everyone.is_(False),
+        _active_group_message_filter(),
     )
 
     normalized_username = username.strip() if isinstance(username, str) else None
@@ -3160,6 +3210,7 @@ def get_group_message_history(group_id, username=None, limit=50, before_timestam
             if (
                 message_row.sender_username != normalized_username
                 and not payload.get("encrypted_key")
+                and payload.get("encryption_mode") != "none"
             ):
                 continue
             payloads.append(payload)
@@ -3268,6 +3319,7 @@ def ack_group_messages_with_payloads(username, group_id, message_ids):
         .filter(
             GroupMessage.message_id.in_(delivered_ids),
             GroupMessage.deleted_for_everyone.is_(False),
+            _active_group_message_filter(),
         )
         .all()
     )
@@ -3328,7 +3380,7 @@ def store_group_message_metadata(payload, group_id):
     else:
         payload = {}
 
-    if not payload.get("group_key_ref"):
+    if (not _is_plaintext_group_payload(payload)) and (not payload.get("group_key_ref")):
         payload["group_key_ref"] = str(uuid.uuid4())
 
     sender = (payload or {}).get("from")
@@ -3519,18 +3571,78 @@ def purge_user_data(username, candidate_usernames=None):
         )
         .all()
     )
+    private_sender_message_ids = []
     for row in private_rows:
         if isinstance(row.message_id, str) and row.message_id:
             removed_message_ids.add(row.message_id)
+            if row.sender_username == username:
+                private_sender_message_ids.append(row.message_id)
+        if isinstance(row.sender_username, str) and row.sender_username:
+            normalized_users.add(row.sender_username)
+        if isinstance(row.recipient_username, str) and row.recipient_username:
+            normalized_users.add(row.recipient_username)
 
     group_rows_by_sender = (
         GroupMessage.query.filter(GroupMessage.sender_username == username).all()
     )
     sender_group_message_ids = []
+    related_group_ids = set()
     for row in group_rows_by_sender:
+        if row.group_id is not None:
+            related_group_ids.add(int(row.group_id))
         if isinstance(row.message_id, str) and row.message_id:
             sender_group_message_ids.append(row.message_id)
             removed_message_ids.add(row.message_id)
+
+    recipient_rows_for_sender = []
+    if sender_group_message_ids:
+        recipient_rows_for_sender = (
+            db.session.query(
+                GroupMessageRecipient.group_id,
+                GroupMessageRecipient.recipient_username,
+                GroupMessageRecipient.message_id,
+            )
+            .filter(GroupMessageRecipient.message_id.in_(sender_group_message_ids))
+            .all()
+        )
+        for group_id, recipient_username, _message_id in recipient_rows_for_sender:
+            if group_id is not None:
+                related_group_ids.add(int(group_id))
+            if isinstance(recipient_username, str) and recipient_username:
+                normalized_users.add(recipient_username)
+
+    recipient_group_rows = (
+        db.session.query(GroupMessageRecipient.group_id)
+        .filter(GroupMessageRecipient.recipient_username == username)
+        .distinct()
+        .all()
+    )
+    for row in recipient_group_rows:
+        if row and row[0] is not None:
+            related_group_ids.add(int(row[0]))
+
+    user_row = User.query.filter_by(username=username).first()
+    if user_row:
+        membership_group_rows = (
+            db.session.query(GroupMember.group_id)
+            .filter(GroupMember.user_id == user_row.id)
+            .distinct()
+            .all()
+        )
+        for row in membership_group_rows:
+            if row and row[0] is not None:
+                related_group_ids.add(int(row[0]))
+
+    owner_group_to_message_ids = {}
+    owners_by_group = {}
+    for group_id, owner, message_id in recipient_rows_for_sender:
+        if not isinstance(owner, str) or not owner:
+            continue
+        if group_id is None or not isinstance(message_id, str) or not message_id:
+            continue
+        normalized_group_id = int(group_id)
+        owner_group_to_message_ids.setdefault((owner, normalized_group_id), set()).add(message_id)
+        owners_by_group.setdefault(normalized_group_id, set()).add(owner)
 
     if sender_group_message_ids:
         GroupMessageRecipient.query.filter(
@@ -3552,28 +3664,9 @@ def purge_user_data(username, candidate_usernames=None):
 
     db.session.commit()
 
-    # Remove private pending messages sent by this user from every known inbox.
     for owner in sorted(normalized_users):
-        messages = _ordered_messages_from_index(
-            list_key=_inbox_key(owner),
-            order_key=_inbox_index_order_key(owner),
-            payload_key=_inbox_index_payload_key(owner),
-            ids_key=_inbox_index_ids_key(owner),
-            ttl_seconds=INBOX_TTL_SECONDS,
-            start=0,
-            end=-1,
-        )
-        removable_ids = [
-            message_id
-            for message_id in (
-                (message or {}).get("message_id")
-                for message in messages
-                if (message or {}).get("from") == username
-            )
-            if isinstance(message_id, str) and message_id
-        ]
-        if removable_ids:
-            _removed_count, removed_payloads = ack_messages_with_payloads(owner, removable_ids)
+        if private_sender_message_ids:
+            _removed_count, removed_payloads = ack_messages_with_payloads(owner, private_sender_message_ids)
             for payload in removed_payloads:
                 message_id = (payload or {}).get("message_id")
                 if isinstance(message_id, str) and message_id:
@@ -3581,6 +3674,7 @@ def purge_user_data(username, candidate_usernames=None):
 
         redis_client.hdel(_chat_unread_count_key(owner), username)
         redis_client.delete(_chat_last_key(owner, username))
+        redis_client.delete(_chat_last_key(username, owner))
         redis_client.srem(f"contacts:{owner}", username)
         redis_client.zrem(f"contact_ts:{owner}", username)
         redis_client.delete(f"private_seen:{owner}:{username}")
@@ -3597,115 +3691,42 @@ def purge_user_data(username, candidate_usernames=None):
     redis_client.delete(f"contact_ts:{username}")
     redis_client.delete(f"message_delete_events:{username}")
 
-    # Remove group pending messages sent by this user from all group inboxes.
-    for inbox_key in _scan_keys("group_user_inbox:*:*"):
-        parts = inbox_key.split(":")
-        if len(parts) != 4:
-            continue
-        owner = parts[2]
-        try:
-            group_id = int(parts[3])
-        except (TypeError, ValueError):
-            continue
-
-        if owner == username:
-            redis_client.delete(_group_inbox_key(owner, group_id))
-            redis_client.delete(_group_inbox_index_order_key(owner, group_id))
-            redis_client.delete(_group_inbox_index_payload_key(owner, group_id))
-            redis_client.delete(_group_inbox_index_ids_key(owner, group_id))
-            continue
-
-        messages = _ordered_messages_from_index(
-            list_key=_group_inbox_key(owner, group_id),
-            order_key=_group_inbox_index_order_key(owner, group_id),
-            payload_key=_group_inbox_index_payload_key(owner, group_id),
-            ids_key=_group_inbox_index_ids_key(owner, group_id),
-            ttl_seconds=GROUP_INBOX_TTL_SECONDS,
-            start=0,
-            end=-1,
+    for (owner, group_id), message_ids in owner_group_to_message_ids.items():
+        _removed_count, removed_payloads = ack_group_messages_with_payloads(
+            owner,
+            group_id,
+            sorted(message_ids),
         )
-        removable_ids = [
-            message_id
-            for message_id in (
-                (message or {}).get("message_id")
-                for message in messages
-                if (message or {}).get("from") == username
-            )
-            if isinstance(message_id, str) and message_id
-        ]
-        if removable_ids:
-            _removed_count, removed_payloads = ack_group_messages_with_payloads(
-                owner,
-                group_id,
-                removable_ids,
-            )
-            for payload in removed_payloads:
-                message_id = (payload or {}).get("message_id")
-                if isinstance(message_id, str) and message_id:
-                    removed_message_ids.add(message_id)
-
-    for key in _scan_keys("chat:last:*"):
-        parts = key.split(":")
-        if len(parts) != 4:
-            continue
-        if parts[2] == username or parts[3] == username:
-            redis_client.delete(key)
-
-    for key in _scan_keys("chat:unread_count:*"):
-        redis_client.hdel(key, username)
-
-    for key in _scan_keys("contacts:*"):
-        redis_client.srem(key, username)
-
-    for key in _scan_keys("contact_ts:*"):
-        redis_client.zrem(key, username)
-
-    for key in _scan_keys("private_seen:*"):
-        parts = key.split(":")
-        if len(parts) != 3:
-            continue
-        if parts[1] == username or parts[2] == username:
-            redis_client.delete(key)
-
-    for key in _scan_keys("private_deleted:*"):
-        parts = key.split(":")
-        if len(parts) != 3:
-            continue
-        if parts[1] == username or username in parts[2]:
-            redis_client.delete(key)
-
-    for key in _scan_keys("group_deleted:*"):
-        parts = key.split(":")
-        if len(parts) != 3:
-            continue
-        if parts[1] == username:
-            redis_client.delete(key)
-
-    for key in _scan_keys("message_delete_events:*"):
-        parts = key.split(":")
-        if len(parts) != 2:
-            continue
-        if parts[1] == username:
-            redis_client.delete(key)
-
-    for key in _scan_keys("message_meta:*"):
-        metadata = _safe_load_json(redis_client.get(key))
-        if not metadata:
-            continue
-        if metadata.get("sender") == username or metadata.get("recipient") == username:
-            message_id = metadata.get("message_id")
+        for payload in removed_payloads:
+            message_id = (payload or {}).get("message_id")
             if isinstance(message_id, str) and message_id:
                 removed_message_ids.add(message_id)
-            redis_client.delete(key)
+
+    for group_id in sorted(related_group_ids):
+        redis_client.delete(_group_inbox_key(username, group_id))
+        redis_client.delete(_group_inbox_index_order_key(username, group_id))
+        redis_client.delete(_group_inbox_index_payload_key(username, group_id))
+        redis_client.delete(_group_inbox_index_ids_key(username, group_id))
+        redis_client.delete(f"group_deleted:{username}:{group_id}")
+        redis_client.delete(f"group_seen:{group_id}:{username}")
+        redis_client.delete(f"group_delivered:{group_id}:{username}")
 
     if removed_message_ids:
-        for key in _scan_keys("private_seen:*"):
-            redis_client.srem(key, *removed_message_ids)
-        for key in _scan_keys("private_deleted:*"):
-            redis_client.srem(key, *removed_message_ids)
-        for key in _scan_keys("group_delivered:*"):
-            redis_client.srem(key, *removed_message_ids)
-        for key in _scan_keys("group_seen:*"):
-            redis_client.srem(key, *removed_message_ids)
-        for key in _scan_keys("group_deleted:*"):
-            redis_client.srem(key, *removed_message_ids)
+        removed_ids = sorted(removed_message_ids)
+
+        for message_id in removed_ids:
+            redis_client.delete(f"message_meta:{message_id}")
+
+        for owner in sorted(normalized_users):
+            redis_client.srem(f"private_seen:{owner}:{username}", *removed_ids)
+            redis_client.srem(f"private_seen:{username}:{owner}", *removed_ids)
+            redis_client.srem(f"private_deleted:{owner}:{username}", *removed_ids)
+            redis_client.srem(f"private_deleted:{username}:{owner}", *removed_ids)
+
+        for group_id in sorted(related_group_ids):
+            redis_client.srem(f"group_delivered:{group_id}", *removed_ids)
+            redis_client.srem(f"group_seen:{group_id}", *removed_ids)
+            redis_client.srem(f"group_deleted:{username}:{group_id}", *removed_ids)
+            owners = owners_by_group.get(group_id, set())
+            for owner in owners:
+                redis_client.srem(f"group_deleted:{owner}:{group_id}", *removed_ids)

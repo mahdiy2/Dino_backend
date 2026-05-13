@@ -23,6 +23,7 @@ from app.services import about_us_service
 from app.services import crash_log_service
 from app.services import auth_service
 from app.services import daily_winner_service
+from app.services import profile_service
 from app.services.post_service import _build_media_url
 from app.constants.badges import USER_BADGE_CATALOG
 from datetime import datetime
@@ -602,29 +603,10 @@ def admin_delete_user(user_id):
     if user.username == current_admin:
         return jsonify({"error": "Cannot delete yourself"}), 400
 
-    user_posts = Post.query.filter_by(author_id=user.id).all()
-    for post in user_posts:
-        Comment.query.filter_by(post_id=post.id).delete()
-        Vote.query.filter(
-            (Vote.target_type == "post") & (Vote.target_id == post.id)
-        ).delete()
-        Post.query.filter(
-            Post.quoted_post_id == post.id
-        ).update(
-            {Post.quoted_post_id: None},
-            synchronize_session=False,
-        )
-        Media.query.filter_by(post_id=post.id).delete()
-        db.session.delete(post)
-
-    Comment.query.filter_by(author_id=user.id).delete()
-    Vote.query.filter_by(user_id=user.id).delete()
-    Follow.query.filter(
-        (Follow.follower_id == user.id) | (Follow.following_id == user.id)
-    ).delete()
-    Profile.query.filter_by(user_id=user.id).delete()
-    db.session.delete(user)
-    db.session.commit()
+    try:
+        profile_service.delete_account(username=user.username)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
     return jsonify({"message": "User deleted"}), 200
 
 

@@ -3,6 +3,7 @@ import uuid
 
 from flask import current_app, has_request_context, request
 from minio.error import S3Error
+from sqlalchemy import or_
 from app.db import db
 from app.extensions.minio_client import get_minio_client
 from app.models.activity_notification_model import ActivityNotification
@@ -244,6 +245,8 @@ def update_profile(
     profile_image_shape=None,
     profile_image=None,
     profile_video=None,
+    remove_profile_image: bool = False,
+    remove_profile_video: bool = False,
 ):
     user = user_repository.get_by_username(username)
     if not user or getattr(user, "is_suspended", False):
@@ -257,8 +260,14 @@ def update_profile(
         and profile_image_shape is None
         and profile_image is None
         and profile_video is None
+        and not remove_profile_image
+        and not remove_profile_video
     ):
         raise ValueError("At least one field is required")
+    if remove_profile_image and profile_image is not None:
+        raise ValueError("Cannot upload and remove profile image in the same request")
+    if remove_profile_video and profile_video is not None:
+        raise ValueError("Cannot upload and remove profile video in the same request")
 
     if name is not None:
         if not isinstance(name, str) or not name.strip():
@@ -283,6 +292,16 @@ def update_profile(
 
     old_image_object_name = None
     old_video_object_name = None
+
+    if remove_profile_image:
+        old_image_object_name = profile.image_object_name
+        profile.image_object_name = None
+
+    if remove_profile_video:
+        current_profile_video = profile_video_repository.get_by_user_id(user.id)
+        if current_profile_video is not None:
+            old_video_object_name = current_profile_video.video_object_name
+            db.session.delete(current_profile_video)
 
     if profile_image is not None:
         if not getattr(profile_image, "filename", ""):
@@ -491,11 +510,6 @@ def delete_account(username: str):
         raise ValueError("User not found")
 
     user_id = int(user.id)
-    all_usernames = [
-        row[0]
-        for row in db.session.query(User.username).all()
-        if row and row[0]
-    ]
     media_object_names = _collect_account_media_object_names(user_id)
 
     user_post_ids = [
@@ -539,15 +553,12 @@ def delete_account(username: str):
         _expand_comment_descendants(authored_comment_ids)
     )
 
-    for object_name in media_object_names:
-        _delete_media_object(object_name)
-
-    message_repository.purge_user_data(
-        username=username,
-        candidate_usernames=all_usernames,
-    )
-
     try:
+        try:
+            message_repository.purge_user_data(username=username)
+        except Exception:
+            db.session.rollback()
+
         User.query.filter(
             User.referred_by_user_id == user_id
         ).update(
@@ -665,3 +676,10 @@ def delete_account(username: str):
     except Exception:
         db.session.rollback()
         raise
+
+    for object_name in media_object_names:
+        try:
+            _delete_media_object(object_name)
+        except Exception:
+            # Media cleanup is best-effort and must not block account deletion.
+            continue

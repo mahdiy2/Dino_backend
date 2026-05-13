@@ -68,6 +68,7 @@ class GroupMessage(db.Model):
     reply_to_sender = db.Column(db.String(80), nullable=True)
     encrypted_reply_preview = db.Column(db.Text, nullable=True)
     timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    expires_at = db.Column(db.DateTime, nullable=True, index=True)
     seen_at = db.Column(db.DateTime, nullable=True, index=True)
     deleted_for_everyone = db.Column(db.Boolean, nullable=False, default=False, index=True)
     deleted_at = db.Column(db.DateTime, nullable=True)

@@ -7,6 +7,17 @@ from app.services import profile_service
 profile_bp = Blueprint("profiles", __name__)
 
 
+def _parse_truthy_flag(raw_value):
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        return raw_value != 0
+    if isinstance(raw_value, str):
+        normalized = raw_value.strip().lower()
+        return normalized in {"1", "true", "yes", "on"}
+    return False
+
+
 @profile_bp.route("/profiles/me", methods=["GET"])
 @jwt_required()
 def get_my_profile():
@@ -50,11 +61,15 @@ def update_my_profile():
     profile_image_shape = None
     profile_image = None
     profile_video = None
+    remove_profile_image = False
+    remove_profile_video = False
 
     if "multipart/form-data" in content_type:
         name = request.form.get("name")
         bio = request.form.get("bio")
         profile_image_shape = request.form.get("profile_image_shape")
+        remove_profile_image = _parse_truthy_flag(request.form.get("remove_profile_image"))
+        remove_profile_video = _parse_truthy_flag(request.form.get("remove_profile_video"))
         profile_image = request.files.get("profile_image") or request.files.get(
             "avatar"
         )
@@ -68,6 +83,8 @@ def update_my_profile():
         name = data.get("name")
         bio = data.get("bio")
         profile_image_shape = data.get("profile_image_shape")
+        remove_profile_image = _parse_truthy_flag(data.get("remove_profile_image"))
+        remove_profile_video = _parse_truthy_flag(data.get("remove_profile_video"))
 
     try:
         profile = profile_service.update_profile(
@@ -77,6 +94,8 @@ def update_my_profile():
             profile_image_shape=profile_image_shape,
             profile_image=profile_image,
             profile_video=profile_video,
+            remove_profile_image=remove_profile_image,
+            remove_profile_video=remove_profile_video,
         )
         return jsonify(profile), 200
     except ValueError as e:

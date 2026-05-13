@@ -7,6 +7,7 @@ from app.services.group_service import (
     NotMutualFollowError,
     NotGroupMemberError,
     NotGroupCreatorError,
+    PublicRoomOperationError,
 )
 from app.services import message_service
 from app.socket_events import (
@@ -50,6 +51,28 @@ def list_groups():
     try:
         groups = group_service.get_user_groups(username)
         return jsonify({"groups": groups})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@group_bp.route("/public-room", methods=["GET"])
+@jwt_required()
+def get_public_room_status():
+    username = get_jwt_identity()
+    try:
+        payload = group_service.get_public_room_status(username)
+        return jsonify(payload), 200
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@group_bp.route("/public-room/join", methods=["POST"])
+@jwt_required()
+def join_public_room():
+    username = get_jwt_identity()
+    try:
+        payload = group_service.join_public_room(username)
+        return jsonify(payload), 200
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -167,6 +190,8 @@ def add_member(group_id):
         return jsonify({"error": str(exc)}), 403
     except NotMutualFollowError as exc:
         return jsonify({"error": str(exc)}), 403
+    except PublicRoomOperationError as exc:
+        return jsonify({"error": str(exc)}), 403
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -207,6 +232,8 @@ def remove_member(group_id, target_username):
         )
         return jsonify({"message": "Member removed"}), 200
     except NotGroupCreatorError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except PublicRoomOperationError as exc:
         return jsonify({"error": str(exc)}), 403
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -267,6 +294,8 @@ def delete_group(group_id):
             )
         return jsonify({"message": "Group deleted"}), 200
     except NotGroupCreatorError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except PublicRoomOperationError as exc:
         return jsonify({"error": str(exc)}), 403
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400

@@ -447,7 +447,9 @@ def get_group_online_users_payload(group_id):
     try:
         from app.repositories import group_repository
 
+        group = group_repository.get_group_by_id(normalized_group_id)
         members = group_repository.get_group_members(normalized_group_id)
+        is_public_room = bool(group.is_public_room) if group is not None else False
         usernames = [
             (member.get("username") or "").strip()
             for member in members
@@ -459,7 +461,12 @@ def get_group_online_users_payload(group_id):
             if not isinstance(member, dict):
                 continue
             username = (member.get("username") or "").strip()
-            if not username or not online_status_by_username.get(username, False):
+            if not username:
+                continue
+            if is_public_room:
+                if not _authorized_group_sids(username, normalized_group_id):
+                    continue
+            elif not online_status_by_username.get(username, False):
                 continue
 
             online_users.append(
@@ -975,8 +982,9 @@ def register_socket_events():
                 user_groups = group_repository.get_groups_for_user(user.id)
                 for group in user_groups:
                     group_room_name = f"group_{group.id}"
-                    join_room(group_room_name)
-                    _track_group_room_join(request.sid, group.id)
+                    if not bool(getattr(group, "is_public_room", False)):
+                        join_room(group_room_name)
+                        _track_group_room_join(request.sid, group.id)
                     _emit_pending_group_messages_chunk(
                         username=username,
                         group_id=group.id,
@@ -1736,6 +1744,15 @@ def register_socket_events():
         join_room(room_name)
         _track_group_room_join(request.sid, group_id)
         emit("group_joined", {"group_id": group_id})
+        try:
+            group = group_repository.get_group_by_id(group_id)
+        except Exception:
+            group = None
+        _emit_pending_group_messages_chunk(
+            username=username,
+            group_id=group_id,
+            group_name=group.name if group else "Group Chat",
+        )
         online_payload = get_group_online_users_payload(group_id)
         if online_payload is not None:
             emit("group_online_users", online_payload)
@@ -1748,6 +1765,37 @@ def register_socket_events():
             },
         )
         logger.debug("User %s joined group room %s", username, room_name)
+
+    @socketio.on("leave_group")
+    def handle_leave_group(data):
+        username = session.get("username")
+        if not username:
+            emit("message_error", {"error": "Unauthorized"})
+            return
+
+        if not isinstance(data, dict) or not data.get("group_id"):
+            emit("message_error", {"error": "group_id is required"})
+            return
+
+        group_id = data.get("group_id")
+        try:
+            normalized_group_id = int(group_id)
+        except (TypeError, ValueError):
+            emit("message_error", {"error": "group_id is required"})
+            return
+
+        room_name = f"group_{normalized_group_id}"
+        try:
+            socketio.server.leave_room(request.sid, room_name, namespace="/")
+        except Exception as exc:
+            logger.warning(
+                "Failed to leave room sid=%s room=%s: %s",
+                request.sid,
+                room_name,
+                exc,
+            )
+        _track_group_room_leave(request.sid, normalized_group_id)
+        emit("group_left", {"group_id": normalized_group_id})
 
     @socketio.on("get_group_online_users")
     def handle_get_group_online_users(data):
@@ -1882,15 +1930,27 @@ def register_socket_events():
         try:
             from app.repositories import user_repository, group_repository
             from app.repositories import message_repository
+            from app.services import public_room_message_expiry_service
 
             user = user_repository.get_by_username(sender)
-            if not user or not group_repository.is_member(group_id, user.id):
+            try:
+                normalized_group_id = int(group_id)
+            except (TypeError, ValueError):
+                emit_group_message_error("group_id is required", "missing_group_id")
+                return
+            group = group_repository.get_group_by_id(normalized_group_id)
+            if group is None:
+                emit_group_message_error("Group not found", "missing_group_id")
+                return
+            is_public_room = bool(group.is_public_room)
+
+            if not user or not group_repository.is_member(normalized_group_id, user.id):
                 emit_group_message_error(
                     "You are not a member of this group",
                     "not_group_member",
                 )
                 return
-            membership_version = group_repository.get_membership_version(group_id)
+            membership_version = group_repository.get_membership_version(normalized_group_id)
 
             normalized_type = message_type
             if normalized_type:
@@ -1916,7 +1976,7 @@ def register_socket_events():
             normalized_group_key_ref = message_repository.normalize_group_key_ref(
                 group_key_ref
             )
-            if not normalized_recipient_keys:
+            if (not is_public_room) and (not normalized_recipient_keys):
                 if not normalized_group_key_ref:
                     emit_group_message_error(
                         "recipient_key_records or group_key_ref is required",
@@ -1938,7 +1998,7 @@ def register_socket_events():
             if client_message_id:
                 existing_payload = message_service.get_group_message_by_client_message_id(
                     sender=sender,
-                    group_id=group_id,
+                    group_id=normalized_group_id,
                     client_message_id=client_message_id,
                 )
                 if existing_payload is not None:
@@ -1956,7 +2016,7 @@ def register_socket_events():
 
             payload = message_repository.build_group_message_payload(
                 sender=sender,
-                group_id=group_id,
+                group_id=normalized_group_id,
                 encrypted_message=message_text,
                 attachment=attachment,
                 message_type=normalized_type,
@@ -1967,11 +2027,17 @@ def register_socket_events():
                 recipient_key_records=recipient_key_records,
                 group_key_ref=normalized_group_key_ref,
                 client_message_id=client_message_id,
+                expires_at=(
+                    (datetime.now(timezone.utc) + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                    if is_public_room
+                    else None
+                ),
+                encryption_mode=("none" if is_public_room else "e2ee"),
             )
 
             side_effects_enqueued = async_task_service.enqueue_group_message_side_effects(
                 sender=sender,
-                group_id=group_id,
+                group_id=normalized_group_id,
                 message_payload=payload,
                 expected_membership_version=membership_version,
                 source="socket.send_group_message",
@@ -1982,7 +2048,7 @@ def register_socket_events():
                 ):
                     group_notification_service.dispatch_group_message_side_effects(
                         sender=sender,
-                        group_id=group_id,
+                        group_id=normalized_group_id,
                         message_payload=payload,
                         expected_membership_version=membership_version,
                     )
@@ -2001,7 +2067,7 @@ def register_socket_events():
 
             canonical_payload, created = message_service.store_group_message_metadata(
                 payload,
-                group_id,
+                normalized_group_id,
             )
             if not created:
                 emit(
@@ -2017,15 +2083,21 @@ def register_socket_events():
                 return
 
             message_repository.record_group_conversation_timestamp(
-                group_id,
+                normalized_group_id,
                 canonical_payload.get("timestamp"),
             )
+            if is_public_room:
+                public_room_message_expiry_service.schedule_public_room_message_expiration_from_payload(
+                    current_app._get_current_object(),
+                    group_id=normalized_group_id,
+                    payload=canonical_payload,
+                )
 
             member_usernames = list(dict.fromkeys(
-                group_repository.get_group_member_usernames(group_id)
+                group_repository.get_group_member_usernames(normalized_group_id)
             ))
             delivery_guard = GroupDeliveryGuard(
-                group_id,
+                normalized_group_id,
                 expected_membership_version=membership_version,
             )
             delivered_count = 0
@@ -2036,7 +2108,7 @@ def register_socket_events():
             for member_username in member_usernames:
                 if not delivery_guard.can_dispatch_to(member_username):
                     continue
-                authorized_sids = _authorized_group_sids(member_username, group_id)
+                authorized_sids = _authorized_group_sids(member_username, normalized_group_id)
                 if not authorized_sids:
                     continue
                 recipient_payload = recipient_payloads.get(member_username)
@@ -2047,7 +2119,7 @@ def register_socket_events():
                 delivered_count += 1
             logger.debug(
                 "Emitting new_group_message for group %s from %s to %d members",
-                group_id, sender, delivered_count,
+                normalized_group_id, sender, delivered_count,
             )
 
             emit("group_message_sent", {
