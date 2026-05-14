@@ -4,6 +4,7 @@ from app.services.post_service import (
     ConcurrentPostUploadError,
     MediaStorageError,
     create_post_with_media,
+    edit_post_by_username,
     get_feed,
     get_post,
     delete_post_by_username,
@@ -97,6 +98,38 @@ def _parse_optional_post_id(value):
         return parsed_value
 
     raise ValueError("quoted_post_id must be a positive integer")
+
+
+def _parse_media_id_collection(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        values = [value]
+
+    parsed_ids = []
+    for item in values:
+        if isinstance(item, bool):
+            raise ValueError("keep_media_ids must contain positive integers")
+        if isinstance(item, int):
+            media_id = item
+        elif isinstance(item, str):
+            normalized = item.strip()
+            if not normalized:
+                continue
+            if not normalized.isdigit():
+                raise ValueError("keep_media_ids must contain positive integers")
+            media_id = int(normalized)
+        else:
+            raise ValueError("keep_media_ids must contain positive integers")
+
+        if media_id <= 0:
+            raise ValueError("keep_media_ids must contain positive integers")
+        parsed_ids.append(media_id)
+
+    return parsed_ids
 
 
 def _extract_post_idempotency_key(data, *, header_value=None):
@@ -285,3 +318,88 @@ def delete_post(post_id):
         return jsonify({"error": str(e)}), 403
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
+
+
+@post_bp.route("/posts/<int:post_id>", methods=["PUT"])
+@jwt_required()
+def edit_post(post_id):
+    username = get_jwt_identity()
+    content_type = (request.content_type or "").lower()
+    text = None
+    files = []
+    followers_only = None
+    track_title = None
+    track_artist = None
+    keep_media_ids = None
+
+    if "multipart/form-data" in content_type:
+        text = request.form.get("text")
+        track_title = request.form.get("track_title")
+        track_artist = request.form.get("track_artist")
+
+        keep_values = request.form.getlist("keep_media_ids")
+        if not keep_values:
+            keep_values = request.form.getlist("keep_media_ids[]")
+        if not keep_values and "keep_media_ids" in request.form:
+            keep_values = [request.form.get("keep_media_ids")]
+        try:
+            keep_media_ids = _parse_media_id_collection(keep_values if keep_values else None)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
+        followers_raw = request.form.get("followers_only")
+        if followers_raw is not None:
+            try:
+                followers_only = _parse_followers_only(followers_raw)
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+
+        files = (
+            request.files.getlist("media")
+            or request.files.getlist("media[]")
+            or request.files.getlist("files")
+        )
+        single = request.files.get("file")
+        if single:
+            files.append(single)
+    else:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "Invalid JSON body"}), 400
+        text = data.get("text")
+        track_title = data.get("track_title")
+        track_artist = data.get("track_artist")
+        try:
+            keep_media_ids = _parse_media_id_collection(data.get("keep_media_ids"))
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
+        if "followers_only" in data:
+            try:
+                followers_only = _parse_followers_only(data.get("followers_only"))
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+
+    try:
+        edit_post_by_username(
+            post_id=post_id,
+            username=username,
+            text=text,
+            files=files,
+            keep_media_ids=keep_media_ids,
+            followers_only=followers_only,
+            track_title=track_title,
+            track_artist=track_artist,
+        )
+        return jsonify({"message": "Post updated", "post_id": post_id}), 200
+    except MediaStorageError as e:
+        return jsonify({"error": str(e)}), 503
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+    except ValueError as e:
+        message = str(e)
+        if message == "Account suspended":
+            return jsonify({"error": message}), 403
+        if message in {"Post not found", "User not found"}:
+            return jsonify({"error": message}), 404
+        return jsonify({"error": message}), 400

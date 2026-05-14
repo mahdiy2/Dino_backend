@@ -15,6 +15,7 @@ class Post(db.Model):
     )
     text = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    edited_at = db.Column(db.DateTime, nullable=True, index=True)
     followers_only = db.Column(db.Boolean, nullable=False, default=False, index=True)
     is_hidden = db.Column(db.Boolean, nullable=False, default=False, index=True)
     hidden_at = db.Column(db.DateTime, nullable=True, index=True)

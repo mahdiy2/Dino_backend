@@ -1483,6 +1483,111 @@ class TestApiRoutes(unittest.TestCase):
         self.assertIsNone(payload["posts"][0]["author"]["profile_image_url"])
         self.assertEqual(payload["posts"][0]["viewer_vote"], 0)
 
+    def test_edit_post_updates_text_and_marks_post_as_edited(self):
+        self._register("alice")
+        headers = self._auth_header("alice")
+
+        create_response = self.client.post(
+            "/api/posts",
+            json={"text": "original content"},
+            headers=headers,
+        )
+        self.assertEqual(create_response.status_code, 201)
+        post_id = create_response.get_json()["post_id"]
+
+        edit_response = self.client.put(
+            f"/api/posts/{post_id}",
+            json={"text": "updated content"},
+            headers=headers,
+        )
+        self.assertEqual(edit_response.status_code, 200)
+        self.assertEqual(edit_response.get_json()["message"], "Post updated")
+
+        detail_response = self.client.get(f"/api/posts/{post_id}", headers=headers)
+        self.assertEqual(detail_response.status_code, 200)
+        payload = detail_response.get_json()["post"]
+        self.assertEqual(payload["text"], "updated content")
+        self.assertTrue(payload["is_edited"])
+        self.assertIsNotNone(payload["edited_at"])
+
+    def test_edit_post_rejects_non_owner(self):
+        self._register("alice")
+        self._register("bob")
+        alice_headers = self._auth_header("alice")
+        bob_headers = self._auth_header("bob")
+
+        create_response = self.client.post(
+            "/api/posts",
+            json={"text": "alice post"},
+            headers=alice_headers,
+        )
+        self.assertEqual(create_response.status_code, 201)
+        post_id = create_response.get_json()["post_id"]
+
+        edit_response = self.client.put(
+            f"/api/posts/{post_id}",
+            json={"text": "bob should not edit"},
+            headers=bob_headers,
+        )
+        self.assertEqual(edit_response.status_code, 403)
+        self.assertEqual(edit_response.get_json()["error"], "You can only edit your own posts")
+
+    def test_edit_music_post_can_replace_track(self):
+        self._register("alice")
+        headers = self._auth_header("alice")
+
+        class FakeMinio:
+            def bucket_exists(self, *args, **kwargs):
+                return True
+
+            def put_object(self, **kwargs):
+                return None
+
+            def remove_object(self, **kwargs):
+                return None
+
+        with patch("app.services.post_service.get_minio_client", return_value=FakeMinio()):
+            create_response = self.client.post(
+                "/api/posts",
+                data={
+                    "text": "first track",
+                    "media": (io.BytesIO(b"audio-one"), "artist_one - song_one.mp3", "audio/mpeg"),
+                    "track_title": "Song One",
+                    "track_artist": "Artist One",
+                },
+                headers=headers,
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(create_response.status_code, 201)
+            post_id = create_response.get_json()["post_id"]
+
+            detail_before = self.client.get(f"/api/posts/{post_id}", headers=headers)
+            self.assertEqual(detail_before.status_code, 200)
+            first_media_id = detail_before.get_json()["post"]["media"][0]["id"]
+
+            edit_response = self.client.put(
+                f"/api/posts/{post_id}",
+                data={
+                    "text": "updated track",
+                    "track_title": "Song Two",
+                    "track_artist": "Artist Two",
+                    "keep_media_ids": "",
+                    "media": (io.BytesIO(b"audio-two"), "artist_two - song_two.mp3", "audio/mpeg"),
+                },
+                headers=headers,
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(edit_response.status_code, 200)
+
+            detail_after = self.client.get(f"/api/posts/{post_id}", headers=headers)
+            self.assertEqual(detail_after.status_code, 200)
+            payload = detail_after.get_json()["post"]
+            self.assertEqual(payload["text"], "updated track")
+            self.assertTrue(payload["is_edited"])
+            self.assertEqual(len(payload["media"]), 1)
+            self.assertEqual(payload["media"][0]["title"], "Song Two")
+            self.assertEqual(payload["media"][0]["artist"], "Artist Two")
+
     def test_create_quote_post_includes_quoted_preview_in_feed_and_detail(self):
         self._register("alice")
         self._register("bob")

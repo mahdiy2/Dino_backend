@@ -253,11 +253,14 @@ def _serialize_post_preview(
     profile_by_user_id: dict,
 ):
     daily_winner_at = getattr(post, "daily_winner_at", None)
+    edited_at = getattr(post, "edited_at", None)
     return {
         "id": post.id,
         "text": post.text,
         "author": _serialize_author(post.author_id, user_by_id, profile_by_user_id),
         "created_at": post.created_at.isoformat(),
+        "edited_at": edited_at.isoformat() if edited_at is not None else None,
+        "is_edited": edited_at is not None,
         "is_daily_winner": bool(getattr(post, "is_daily_winner", False)),
         "was_daily_winner": daily_winner_at is not None,
         "daily_winner_at": (
@@ -318,12 +321,15 @@ def _serialize_post(
         if quoted_post_id is not None
         else None
     )
+    edited_at = getattr(post, "edited_at", None)
 
     return {
         "id": post.id,
         "text": post.text,
         "author": author_payload,
         "created_at": post.created_at.isoformat(),
+        "edited_at": edited_at.isoformat() if edited_at is not None else None,
+        "is_edited": edited_at is not None,
         "is_daily_winner": bool(getattr(post, "is_daily_winner", False)),
         "was_daily_winner": daily_winner_at is not None,
         "daily_winner_at": (
@@ -842,6 +848,191 @@ def _resolve_visible_quoted_post_for_author(
     if not quoted_post:
         raise ValueError("Quoted post not found")
     return quoted_post
+
+
+def _normalize_keep_media_ids(raw_media_ids, *, post_id: int, existing_media_by_id: dict[int, Media]):
+    if raw_media_ids is None:
+        return set(existing_media_by_id.keys())
+
+    keep_ids = set()
+    for raw_id in raw_media_ids:
+        try:
+            media_id = int(raw_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("keep_media_ids must contain positive integers") from exc
+
+        if media_id <= 0:
+            raise ValueError("keep_media_ids must contain positive integers")
+        media = existing_media_by_id.get(media_id)
+        if media is None:
+            raise ValueError(f"Media id {media_id} does not belong to post {post_id}")
+        keep_ids.add(media_id)
+    return keep_ids
+
+
+def _normalize_media_upload_files(files):
+    files = files or []
+    if len(files) > MAX_MEDIA_FILES:
+        raise ValueError("Maximum 8 media files allowed")
+
+    normalized_files = []
+    for file in files:
+        if not getattr(file, "filename", ""):
+            raise ValueError("Media file is required")
+        declared_mimetype = _normalize_mimetype(getattr(file, "mimetype", ""))
+        guessed_mimetype = _guess_mimetype_from_filename(file.filename)
+        mimetype = declared_mimetype
+        if (
+            mimetype in {"", "application/octet-stream"}
+            and guessed_mimetype.startswith(("audio/", "image/", "video/"))
+        ):
+            mimetype = guessed_mimetype
+
+        if bool(current_app.config.get("MEDIA_CONTENT_SNIFFING_ENABLED", True)):
+            content_validation_error = validate_upload_content(
+                file,
+                mimetype,
+                allowed_categories={"image", "video", "audio"},
+                reject_active_text_payloads=bool(
+                    current_app.config.get("MEDIA_CONTENT_REJECT_ACTIVE_TEXT", True)
+                ),
+                enforce_declared_category_match=bool(
+                    current_app.config.get("MEDIA_CONTENT_ENFORCE_CATEGORY_MATCH", True)
+                ),
+                sniff_bytes=int(current_app.config.get("MEDIA_CONTENT_SNIFF_BYTES", 2048)),
+            )
+            if content_validation_error in {
+                "unsupported_declared_type",
+                "unsupported_detected_type",
+            }:
+                raise ValueError(f"Unsupported media type: {mimetype or 'unknown'}")
+            if content_validation_error in {"blocked_active_content", "declared_type_mismatch"}:
+                raise ValueError("Invalid media content for declared type")
+            if content_validation_error is not None:
+                raise ValueError("Could not validate media file")
+        normalized_files.append((file, file.filename, mimetype))
+
+    return normalized_files
+
+
+def _prepare_validated_media_files(
+    normalized_files,
+    *,
+    track_title: str | None = None,
+    track_artist: str | None = None,
+):
+    validated_files = []
+    has_audio_file = any(_is_audio_mimetype(mimetype) for _, _, mimetype in normalized_files)
+
+    if has_audio_file and len(normalized_files) != 1:
+        raise ValueError("Music posts can contain only one audio file")
+
+    for file, file_name, mimetype in normalized_files:
+        if _is_audio_mimetype(mimetype):
+            extension = _extension_for_mimetype(mimetype)
+            display_name, title, artist = _build_audio_metadata(
+                file_name=file_name,
+                track_title=track_title,
+                track_artist=track_artist,
+            )
+            validated_files.append(
+                (
+                    file,
+                    mimetype,
+                    extension,
+                    display_name,
+                    title,
+                    artist,
+                )
+            )
+            continue
+
+        if _is_video_mimetype(mimetype):
+            if mimetype in VIDEO_MIME_TYPES_WITH_RELIABLE_DURATION:
+                duration_seconds = _get_mp4_duration_seconds(file)
+                if duration_seconds is None:
+                    raise ValueError("Could not determine video duration")
+                if duration_seconds > MAX_VIDEO_DURATION_SECONDS:
+                    raise ValueError("Video must be 30 minutes or shorter")
+        elif not _is_image_mimetype(mimetype):
+            raise ValueError(f"Unsupported media type: {mimetype}")
+
+        extension = _extension_for_mimetype(mimetype)
+        validated_files.append((file, mimetype, extension, None, None, None))
+
+    return validated_files
+
+
+def _store_validated_media_files_for_post(post_id: int, validated_files):
+    if not validated_files:
+        return []
+
+    media_post_process_items = []
+    minio = None
+    bucket = current_app.config["MINIO_BUCKET"]
+    local_fallback_enabled = bool(
+        current_app.config.get("MEDIA_LOCAL_FALLBACK_ENABLED", True)
+    )
+    use_local_storage = False
+
+    try:
+        minio = get_minio_client()
+        bucket_exists = minio.bucket_exists(bucket)
+        if not bucket_exists:
+            minio.make_bucket(bucket)
+    except Exception as e:
+        if not local_fallback_enabled:
+            db.session.rollback()
+            raise MediaStorageError("Media storage is unavailable") from e
+        use_local_storage = True
+
+    for file, mimetype, extension, display_name, title, artist in validated_files:
+        object_name = None
+
+        if not use_local_storage:
+            try:
+                object_name = f"posts/{post_id}/{uuid.uuid4()}.{extension}"
+                stream, length = _get_stream_and_length(file)
+                upload_kwargs = {
+                    "bucket_name": bucket,
+                    "object_name": object_name,
+                    "data": stream,
+                    "length": length,
+                    "content_type": mimetype,
+                }
+                if length == -1:
+                    upload_kwargs["part_size"] = 10 * 1024 * 1024
+
+                minio.put_object(**upload_kwargs)
+            except Exception as e:
+                if not local_fallback_enabled:
+                    db.session.rollback()
+                    raise MediaStorageError("Media storage is unavailable") from e
+                use_local_storage = True
+
+        if use_local_storage:
+            try:
+                object_name = _store_media_locally(file, post_id, extension)
+            except Exception as e:
+                db.session.rollback()
+                raise MediaStorageError("Media storage is unavailable") from e
+
+        add_media(
+            post_id=post_id,
+            object_name=object_name,
+            mime_type=mimetype,
+            display_name=display_name,
+            title=title,
+            artist=artist,
+        )
+        media_post_process_items.append(
+            {
+                "object_name": object_name,
+                "mime_type": mimetype,
+            }
+        )
+
+    return media_post_process_items
 
 
 def create_post_with_media(
@@ -1860,6 +2051,116 @@ def get_posts_by_username(
         "total": total,
         "posts": serialized_posts
     }
+
+
+def edit_post_by_username(
+    *,
+    post_id: int,
+    username: str,
+    text: str | None = None,
+    files=None,
+    keep_media_ids=None,
+    followers_only: bool | None = None,
+    track_title: str | None = None,
+    track_artist: str | None = None,
+):
+    user = user_repository.get_by_username(username)
+    if not user or getattr(user, "is_suspended", False):
+        raise ValueError("User not found")
+
+    post = Post.query.get(post_id)
+    if not post or post.is_hidden:
+        raise ValueError("Post not found")
+    if post.author_id != user.id:
+        raise PermissionError("You can only edit your own posts")
+
+    existing_media = (
+        Media.query
+        .filter(Media.post_id == post.id)
+        .order_by(Media.id.asc())
+        .all()
+    )
+    existing_media_by_id = {media.id: media for media in existing_media}
+    keep_ids = _normalize_keep_media_ids(
+        keep_media_ids,
+        post_id=post.id,
+        existing_media_by_id=existing_media_by_id,
+    )
+    kept_media = [media for media in existing_media if media.id in keep_ids]
+
+    normalized_files = _normalize_media_upload_files(files)
+    validated_files = _prepare_validated_media_files(
+        normalized_files,
+        track_title=track_title,
+        track_artist=track_artist,
+    )
+
+    resulting_media_count = len(kept_media) + len(validated_files)
+    if resulting_media_count > MAX_MEDIA_FILES:
+        raise ValueError("Maximum 8 media files allowed")
+
+    has_kept_audio = any(_is_audio_mimetype(media.mime_type) for media in kept_media)
+    has_new_audio = any(_is_audio_mimetype(mimetype) for _, mimetype, _, _, _, _ in validated_files)
+    has_any_audio = has_kept_audio or has_new_audio
+    has_visual_media = any(not _is_audio_mimetype(media.mime_type) for media in kept_media) or any(
+        not _is_audio_mimetype(mimetype)
+        for _, mimetype, _, _, _, _ in validated_files
+    )
+
+    if has_any_audio:
+        if resulting_media_count != 1 or has_visual_media:
+            raise ValueError("Music posts can contain only one audio file")
+    elif resulting_media_count == 0 and not (isinstance(text, str) and text.strip()):
+        raise ValueError("Text is required")
+
+    cleaned_text = post.text
+    if text is not None:
+        if not isinstance(text, str):
+            raise ValueError("text must be a string")
+        cleaned_text = text.strip()
+
+    if not has_any_audio and cleaned_text == "":
+        raise ValueError("Text is required")
+
+    media_to_remove = [media for media in existing_media if media.id not in keep_ids]
+    media_ids_to_remove = [media.id for media in media_to_remove]
+    media_object_names_to_remove = [media.object_name for media in media_to_remove]
+
+    media_post_process_items = []
+    try:
+        post.text = cleaned_text
+        if followers_only is not None:
+            post.followers_only = bool(followers_only)
+        post.edited_at = datetime.utcnow()
+
+        if media_ids_to_remove:
+            PlaylistTrack.query.filter(
+                PlaylistTrack.media_id.in_(media_ids_to_remove)
+            ).delete(synchronize_session=False)
+            Media.query.filter(Media.id.in_(media_ids_to_remove)).delete(
+                synchronize_session=False
+            )
+
+        media_post_process_items = _store_validated_media_files_for_post(post.id, validated_files)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+
+    for object_name in media_object_names_to_remove:
+        try:
+            _delete_media_object(object_name)
+        except Exception:
+            pass
+
+    if media_post_process_items:
+        async_task_service.enqueue_media_post_process_task(
+            post_id=post.id,
+            media_items=media_post_process_items,
+            source="post_service.edit_post_by_username",
+        )
+
+    return post
 
 
 def delete_post_by_username(post_id: int, username: str):
