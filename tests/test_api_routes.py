@@ -3716,6 +3716,42 @@ class TestApiRoutes(unittest.TestCase):
         after_unfollow_payload = profile_after_unfollow.get_json()
         self.assertEqual(after_unfollow_payload["followers_count"], 0)
 
+    def test_profile_remove_follower_flow(self):
+        self._register("alice")
+        self._register("bob")
+        alice_headers = self._auth_header("alice")
+        bob_headers = self._auth_header("bob")
+
+        self.assertEqual(
+            self.client.post("/api/follows/alice", headers=bob_headers).status_code,
+            200,
+        )
+
+        profile_after_follow = self.client.get("/api/profiles/alice")
+        self.assertEqual(profile_after_follow.status_code, 200)
+        self.assertEqual(profile_after_follow.get_json()["followers_count"], 1)
+
+        remove_resp = self.client.delete(
+            "/api/follows/me/followers/bob",
+            headers=alice_headers,
+        )
+        self.assertEqual(remove_resp.status_code, 200)
+        self.assertEqual(remove_resp.get_json()["message"], "Follower removed")
+
+        profile_after_remove = self.client.get("/api/profiles/alice")
+        self.assertEqual(profile_after_remove.status_code, 200)
+        self.assertEqual(profile_after_remove.get_json()["followers_count"], 0)
+
+        remove_again_resp = self.client.delete(
+            "/api/follows/me/followers/bob",
+            headers=alice_headers,
+        )
+        self.assertEqual(remove_again_resp.status_code, 200)
+        self.assertEqual(
+            remove_again_resp.get_json()["message"],
+            "User is not a follower",
+        )
+
     def test_block_user_hides_profiles_posts_and_search_results(self):
         self._register("alice")
         self._register("bob")

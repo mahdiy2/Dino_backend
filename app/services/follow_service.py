@@ -64,6 +64,18 @@ def unfollow_by_username(follower_username: str, following_username: str) -> boo
     return delete_follow(follower.id, target.id)
 
 
+def remove_follower_by_username(owner_username: str, follower_username: str) -> bool:
+    owner = user_repository.get_by_username(owner_username)
+    follower = user_repository.get_by_username(follower_username)
+
+    if not _is_active_user(owner) or not _is_active_user(follower):
+        raise ValueError("User not found")
+    if owner.id == follower.id:
+        raise ValueError("You cannot remove yourself from followers")
+
+    return delete_follow(follower.id, owner.id)
+
+
 def get_following_for_username(username: str):
     user = user_repository.get_by_username(username)
     if not _is_active_user(user):

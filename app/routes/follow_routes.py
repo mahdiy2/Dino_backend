@@ -56,6 +56,24 @@ def unfollow_user(username):
     ), 200
 
 
+@follow_bp.route("/follows/me/followers/<username>", methods=["DELETE"])
+@jwt_required()
+def remove_follower(username):
+    requester = get_jwt_identity()
+
+    try:
+        removed = follow_service.remove_follower_by_username(requester, username)
+    except ValueError as e:
+        error = str(e)
+        if error == "User not found":
+            return jsonify({"error": error}), 404
+        return jsonify({"error": error}), 400
+
+    return jsonify(
+        {"message": "Follower removed"} if removed else {"message": "User is not a follower"}
+    ), 200
+
+
 @follow_bp.route("/follows/<username>/status", methods=["GET"])
 @jwt_required()
 def follow_status(username):
