@@ -261,6 +261,27 @@ def get_group_member_count(group_id: int) -> int:
     return GroupMember.query.filter_by(group_id=group_id).count()
 
 
+def get_oldest_member_user_id(group_id: int) -> int | None:
+    row = (
+        db.session.query(GroupMember.user_id)
+        .filter(GroupMember.group_id == group_id)
+        .order_by(GroupMember.joined_at.asc(), GroupMember.user_id.asc())
+        .first()
+    )
+    if row is None:
+        return None
+    return int(row[0])
+
+
+def set_group_creator(group_id: int, creator_id: int) -> bool:
+    group = Group.query.get(group_id)
+    if not group:
+        return False
+    group.creator_id = int(creator_id)
+    db.session.commit()
+    return True
+
+
 def get_group_member_counts(group_ids: list[int]) -> dict[int, int]:
     if not group_ids:
         return {}

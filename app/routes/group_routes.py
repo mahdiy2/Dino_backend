@@ -271,6 +271,8 @@ def leave_group(group_id):
             },
         )
         return jsonify({"message": "You have left the group"}), 200
+    except PublicRoomOperationError as exc:
+        return jsonify({"error": str(exc)}), 403
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 

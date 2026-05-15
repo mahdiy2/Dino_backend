@@ -442,13 +442,32 @@ def remove_member_from_group(requester_username: str, group_id: int, target_user
         raise PublicRoomOperationError("Public room members cannot remove others")
 
     if requester.id == target.id:
-        if group.creator_id == requester.id:
-            raise ValueError("Group creator cannot leave the group. Delete the group instead.")
         removed = group_repository.remove_member(group_id, requester.id)
         if not removed:
             raise ValueError("You are not a member of this group")
+
+        remaining_member_count = group_repository.get_group_member_count(group_id)
+        if remaining_member_count <= 0 and not group.is_public_room:
+            message_repository.purge_group_data(group_id)
+            group_repository.delete_group(group_id)
+            group_repository.clear_membership_version(group_id)
+            return {
+                "group_deleted": True,
+                "creator_reassigned": False,
+            }
+
+        creator_reassigned = False
+        if remaining_member_count > 0 and group.creator_id == requester.id:
+            next_creator_id = group_repository.get_oldest_member_user_id(group_id)
+            if next_creator_id is not None and next_creator_id != group.creator_id:
+                group_repository.set_group_creator(group_id, next_creator_id)
+                creator_reassigned = True
+
         group_repository.bump_membership_version(group_id)
-        return True
+        return {
+            "group_deleted": False,
+            "creator_reassigned": creator_reassigned,
+        }
 
     if group.creator_id != requester.id:
         raise NotGroupCreatorError("Only the group creator can remove members")
@@ -457,7 +476,10 @@ def remove_member_from_group(requester_username: str, group_id: int, target_user
     if not removed:
         raise ValueError("User is not a member of this group")
     group_repository.bump_membership_version(group_id)
-    return True
+    return {
+        "group_deleted": False,
+        "creator_reassigned": False,
+    }
 
 
 def delete_group(requester_username: str, group_id: int):
@@ -475,6 +497,7 @@ def delete_group(requester_username: str, group_id: int):
     if group.creator_id != requester.id:
         raise NotGroupCreatorError("Only the group creator can delete the group")
 
+    message_repository.purge_group_data(group_id)
     group_repository.delete_group(group_id)
     group_repository.clear_membership_version(group_id)
     return True

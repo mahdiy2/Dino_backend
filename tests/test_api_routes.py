@@ -5720,6 +5720,169 @@ class TestApiRoutes(unittest.TestCase):
         send = self.client.post("/api/messages/send", headers=headers, json={})
         self.assertEqual(send.status_code, 410)
 
+    def test_leave_group_allows_creator_to_leave_and_reassigns_creator(self):
+        self._register("alice")
+        self._register("bob")
+        headers = self._auth_header("alice")
+
+        with self.app.app_context():
+            from app.models.group_model import Group, GroupMember
+            from app.models.user_model import User
+
+            alice = User.query.filter_by(username="alice").first()
+            bob = User.query.filter_by(username="bob").first()
+            self.assertIsNotNone(alice)
+            self.assertIsNotNone(bob)
+
+            group = Group(name="friends", creator_id=alice.id)
+            self.db.session.add(group)
+            self.db.session.flush()
+            self.db.session.add(GroupMember(group_id=group.id, user_id=alice.id))
+            self.db.session.add(GroupMember(group_id=group.id, user_id=bob.id))
+            self.db.session.commit()
+            group_id = group.id
+            bob_id = bob.id
+            alice_id = alice.id
+
+        response = self.client.post(
+            f"/api/groups/{group_id}/leave",
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["message"], "You have left the group")
+
+        with self.app.app_context():
+            from app.models.group_model import Group, GroupMember
+
+            group = Group.query.get(group_id)
+            self.assertIsNotNone(group)
+            self.assertEqual(group.creator_id, bob_id)
+
+            alice_membership = GroupMember.query.filter_by(
+                group_id=group_id,
+                user_id=alice_id,
+            ).first()
+            self.assertIsNone(alice_membership)
+
+            bob_membership = GroupMember.query.filter_by(
+                group_id=group_id,
+                user_id=bob_id,
+            ).first()
+            self.assertIsNotNone(bob_membership)
+
+    def test_leave_group_deletes_group_and_related_data_when_last_member_leaves(self):
+        self._register("alice")
+        headers = self._auth_header("alice")
+
+        with self.app.app_context():
+            from app.models.chat_message_model import (
+                GroupMessage,
+                GroupMessageKeyRecipient,
+                GroupMessageRecipient,
+                GroupMessageUserDelete,
+                MessageReaction,
+            )
+            from app.models.group_model import Group, GroupMember
+            from app.models.user_model import User
+
+            alice = User.query.filter_by(username="alice").first()
+            self.assertIsNotNone(alice)
+
+            group = Group(name="solo-group", creator_id=alice.id)
+            self.db.session.add(group)
+            self.db.session.flush()
+            self.db.session.add(GroupMember(group_id=group.id, user_id=alice.id))
+
+            message_id = "leave-cleanup-msg-1"
+            self.db.session.add(
+                GroupMessage(
+                    message_id=message_id,
+                    group_id=group.id,
+                    sender_username="alice",
+                    encrypted_message="enc",
+                )
+            )
+            self.db.session.add(
+                GroupMessageRecipient(
+                    message_id=message_id,
+                    group_id=group.id,
+                    recipient_username="alice",
+                    encrypted_key="k",
+                )
+            )
+            self.db.session.add(
+                GroupMessageUserDelete(
+                    message_id=message_id,
+                    group_id=group.id,
+                    username="alice",
+                )
+            )
+            self.db.session.add(
+                GroupMessageKeyRecipient(
+                    group_id=group.id,
+                    sender_username="alice",
+                    group_key_ref="key-ref-1",
+                    recipient_username="alice",
+                    encrypted_key="enc-key",
+                )
+            )
+            self.db.session.add(
+                MessageReaction(
+                    message_id=message_id,
+                    message_scope="group",
+                    group_id=group.id,
+                    username="alice",
+                    emoji="👍",
+                )
+            )
+            self.db.session.commit()
+            group_id = group.id
+
+        self.fake_redis.hset("group:membership_versions", str(group_id), "9")
+        self.fake_redis.setex(f"message_meta:{message_id}", 3600, "{\"group_id\":1}")
+        self.fake_redis.rpush(f"group_user_inbox:alice:{group_id}", "{\"message_id\":\"x\"}")
+        self.fake_redis.set(f"group_inbox_order:alice:{group_id}", "1")
+        self.fake_redis.set(f"group_inbox_payloads:alice:{group_id}", "1")
+        self.fake_redis.set(f"group_inbox_ids:alice:{group_id}", "1")
+        self.fake_redis.set(f"group_deleted:alice:{group_id}", "1")
+        self.fake_redis.sadd(f"group_seen:{group_id}", message_id)
+        self.fake_redis.sadd(f"group_delivered:{group_id}", message_id)
+        self.fake_redis.sadd(f"group_seen:{group_id}:alice", message_id)
+        self.fake_redis.sadd(f"group_delivered:{group_id}:alice", message_id)
+        self.fake_redis.zadd("group_ts:global", {str(group_id): 123.0})
+
+        response = self.client.post(
+            f"/api/groups/{group_id}/leave",
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["message"], "You have left the group")
+
+        with self.app.app_context():
+            from app.models.chat_message_model import (
+                GroupMessage,
+                GroupMessageKeyRecipient,
+                GroupMessageRecipient,
+                GroupMessageUserDelete,
+                MessageReaction,
+            )
+            from app.models.group_model import Group, GroupMember
+
+            self.assertIsNone(Group.query.get(group_id))
+            self.assertEqual(GroupMember.query.filter_by(group_id=group_id).count(), 0)
+            self.assertEqual(GroupMessage.query.filter_by(group_id=group_id).count(), 0)
+            self.assertEqual(GroupMessageRecipient.query.filter_by(group_id=group_id).count(), 0)
+            self.assertEqual(GroupMessageUserDelete.query.filter_by(group_id=group_id).count(), 0)
+            self.assertEqual(GroupMessageKeyRecipient.query.filter_by(group_id=group_id).count(), 0)
+            self.assertEqual(
+                MessageReaction.query.filter_by(group_id=group_id, message_scope="group").count(),
+                0,
+            )
+
+        self.assertIsNone(self.fake_redis.get(f"message_meta:{message_id}"))
+        self.assertEqual(self.fake_redis.zscore("group_ts:global", str(group_id)), None)
+        self.assertEqual(self.fake_redis.keys(f"*:{group_id}"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

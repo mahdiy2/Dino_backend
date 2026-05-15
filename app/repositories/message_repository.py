@@ -3105,6 +3105,72 @@ def purge_group_delivery_for_user(group_id, username):
     return len(removed_message_ids)
 
 
+def purge_group_data(group_id):
+    if not group_id:
+        return 0
+
+    try:
+        normalized_group_id = int(group_id)
+    except (TypeError, ValueError):
+        return 0
+
+    removed_message_ids = set()
+    if _db_available():
+        message_id_rows = (
+            db.session.query(GroupMessage.message_id)
+            .filter(GroupMessage.group_id == normalized_group_id)
+            .all()
+        )
+        for row in message_id_rows:
+            message_id = row[0] if row else None
+            if isinstance(message_id, str) and message_id:
+                removed_message_ids.add(message_id)
+
+        GroupMessageRecipient.query.filter(
+            GroupMessageRecipient.group_id == normalized_group_id
+        ).delete(synchronize_session=False)
+        GroupMessageUserDelete.query.filter(
+            GroupMessageUserDelete.group_id == normalized_group_id
+        ).delete(synchronize_session=False)
+        GroupMessageKeyRecipient.query.filter(
+            GroupMessageKeyRecipient.group_id == normalized_group_id
+        ).delete(synchronize_session=False)
+        MessageReaction.query.filter(
+            MessageReaction.message_scope == "group",
+            MessageReaction.group_id == normalized_group_id,
+        ).delete(synchronize_session=False)
+        GroupMessage.query.filter(
+            GroupMessage.group_id == normalized_group_id
+        ).delete(synchronize_session=False)
+        db.session.commit()
+
+    redis_client.delete(f"group_delivered:{normalized_group_id}")
+    redis_client.delete(f"group_seen:{normalized_group_id}")
+    redis_client.zrem("group_ts:global", str(normalized_group_id))
+
+    if removed_message_ids:
+        removed_ids = sorted(removed_message_ids)
+        for message_id in removed_ids:
+            redis_client.delete(f"message_meta:{message_id}")
+        redis_client.srem(f"group_delivered:{normalized_group_id}", *removed_ids)
+        redis_client.srem(f"group_seen:{normalized_group_id}", *removed_ids)
+
+    key_patterns = [
+        f"group_user_inbox:*:{normalized_group_id}",
+        f"group_inbox_order:*:{normalized_group_id}",
+        f"group_inbox_payloads:*:{normalized_group_id}",
+        f"group_inbox_ids:*:{normalized_group_id}",
+        f"group_deleted:*:{normalized_group_id}",
+        f"group_seen:{normalized_group_id}:*",
+        f"group_delivered:{normalized_group_id}:*",
+    ]
+    for pattern in key_patterns:
+        for key in _scan_keys(pattern):
+            redis_client.delete(key)
+
+    return len(removed_message_ids)
+
+
 def get_group_message_history(group_id, username=None, limit=50, before_timestamp=None):
     if not _db_available():
         return {
