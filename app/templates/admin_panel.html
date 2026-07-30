@@ -1014,6 +1014,9 @@ function renderReportsTable(data) {
       actions.push(`<button class="btn btn-danger" onclick="handleReport(${r.id}, 'delete_account')">Delete Account</button>`);
     } else {
       actions.push(`<span class="badge badge-user">${esc(r.admin_decision || 'handled')}</span>`);
+      if (r.rollback_available === true) {
+        actions.push(`<button class="btn btn-success" onclick="rollbackReportDecision(${r.id})">Rollback</button>`);
+      }
     }
 
     html += `<tr>
@@ -1053,6 +1056,29 @@ function handleReport(reportId, decision) {
 
     if (res.ok) {
       toast('Report handled');
+      searchReports(reportsPage);
+      if (currentTab === 'posts') searchPosts(postsPage);
+    } else {
+      const d = await res.json();
+      toast(d.error || 'Failed', 'error');
+    }
+  });
+}
+
+function rollbackReportDecision(reportId) {
+  confirm_action('Restore the deleted post/account from this report?', async () => {
+    const res = await api('/api/reports/' + reportId + '/rollback', {
+      method: 'POST',
+    });
+
+    if (res.ok) {
+      const payload = await res.json();
+      const restoredPosts = Number(payload.restored_posts || 0);
+      const restoredUsers = Number(payload.restored_users || 0);
+      const parts = [];
+      if (restoredUsers > 0) parts.push(restoredUsers + ' account restored');
+      if (restoredPosts > 0) parts.push(restoredPosts + ' post restored');
+      toast(parts.length ? parts.join(' · ') : 'Rollback completed');
       searchReports(reportsPage);
       if (currentTab === 'posts') searchPosts(postsPage);
     } else {

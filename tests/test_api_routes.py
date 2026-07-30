@@ -4811,6 +4811,66 @@ class TestApiRoutes(unittest.TestCase):
             self.assertTrue(post.is_hidden)
             self.assertIsNotNone(post.purge_after)
 
+    def test_report_rollback_delete_post_restores_post(self):
+        self._register("alice")
+        self._register("bob")
+        self._register("admin")
+        self._make_admin("admin")
+
+        alice_headers = self._auth_header("alice")
+        bob_headers = self._auth_header("bob")
+        admin_headers = self._auth_header("admin")
+
+        create_post = self.client.post(
+            "/api/posts",
+            json={"text": "reported post"},
+            headers=bob_headers,
+        )
+        self.assertEqual(create_post.status_code, 201)
+        post_id = create_post.get_json()["post_id"]
+
+        report_resp = self.client.post(
+            f"/api/posts/{post_id}/reports",
+            json={"report_type": "spam"},
+            headers=alice_headers,
+        )
+        self.assertEqual(report_resp.status_code, 201)
+        report_id = report_resp.get_json()["report_id"]
+
+        handle_resp = self.client.post(
+            f"/admin/api/reports/{report_id}/handle",
+            json={"decision": "delete_post"},
+            headers=admin_headers,
+        )
+        self.assertEqual(handle_resp.status_code, 200)
+
+        rollback_resp = self.client.post(
+            f"/admin/api/reports/{report_id}/rollback",
+            headers=admin_headers,
+        )
+        self.assertEqual(rollback_resp.status_code, 200)
+        rollback_payload = rollback_resp.get_json()
+        self.assertEqual(rollback_payload["restored_users"], 0)
+        self.assertEqual(rollback_payload["restored_posts"], 1)
+        self.assertFalse(rollback_payload["report"]["rollback_available"])
+
+        feed_resp = self.client.get("/api/posts")
+        self.assertEqual(feed_resp.status_code, 200)
+        self.assertEqual(feed_resp.get_json()["total"], 1)
+
+        comments_resp = self.client.get(f"/api/posts/{post_id}/comments")
+        self.assertEqual(comments_resp.status_code, 200)
+
+        with self.app.app_context():
+            from app.models.post_model import Post
+
+            post = Post.query.get(post_id)
+            self.assertIsNotNone(post)
+            self.assertFalse(post.is_hidden)
+            self.assertIsNone(post.purge_after)
+            self.assertIsNone(post.hidden_by_report_id)
+            self.assertIsNone(post.hidden_reason)
+
     def test_report_post_and_handle_delete_account_suspends_user(self):
         self._register("alice")
         self._register("bob")
@@ -4869,6 +4929,104 @@ class TestApiRoutes(unittest.TestCase):
             post = Post.query.get(post_id)
             self.assertIsNotNone(post)
             self.assertTrue(post.is_hidden)
+
+    def test_report_rollback_delete_account_restores_user_and_device(self):
+        self._register("alice")
+        self._register("admin")
+        self._make_admin("admin")
+
+        bob_register = self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "bob",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "device_id": "android-rollback-report-1",
+            },
+        )
+        self.assertEqual(bob_register.status_code, 201)
+
+        alice_headers = self._auth_header("alice")
+        bob_headers = self._auth_header("bob")
+        admin_headers = self._auth_header("admin")
+
+        create_post = self.client.post(
+            "/api/posts",
+            json={"text": "reported account post"},
+            headers=bob_headers,
+        )
+        self.assertEqual(create_post.status_code, 201)
+        post_id = create_post.get_json()["post_id"]
+
+        report_resp = self.client.post(
+            f"/api/posts/{post_id}/reports",
+            json={"report_type": "scam"},
+            headers=alice_headers,
+        )
+        self.assertEqual(report_resp.status_code, 201)
+        report_id = report_resp.get_json()["report_id"]
+
+        handle_resp = self.client.post(
+            f"/admin/api/reports/{report_id}/handle",
+            json={"decision": "delete_account"},
+            headers=admin_headers,
+        )
+        self.assertEqual(handle_resp.status_code, 200)
+
+        rollback_resp = self.client.post(
+            f"/admin/api/reports/{report_id}/rollback",
+            headers=admin_headers,
+        )
+        self.assertEqual(rollback_resp.status_code, 200)
+        rollback_payload = rollback_resp.get_json()
+        self.assertEqual(rollback_payload["restored_users"], 1)
+        self.assertGreaterEqual(rollback_payload["restored_posts"], 1)
+
+        profile_resp = self.client.get("/api/profiles/bob")
+        self.assertEqual(profile_resp.status_code, 200)
+
+        login_resp = self.client.post(
+            "/api/auth/login",
+            json={"username": "bob", "password": "pass123"},
+        )
+        self.assertEqual(login_resp.status_code, 200)
+
+        retry_register = self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "bob_retry",
+                "password": "pass123",
+                "public_key": TEST_RSA_PUBLIC_KEY,
+                "device_id": "android-rollback-report-1",
+            },
+        )
+        self.assertEqual(retry_register.status_code, 201)
+
+        feed_resp = self.client.get("/api/posts")
+        self.assertEqual(feed_resp.status_code, 200)
+        self.assertEqual(feed_resp.get_json()["total"], 1)
+
+        with self.app.app_context():
+            from app.models.banned_device_model import BannedDevice
+            from app.models.post_model import Post
+            from app.models.user_model import User
+
+            user = User.query.filter_by(username="bob").first()
+            self.assertIsNotNone(user)
+            self.assertFalse(user.is_suspended)
+            self.assertIsNone(user.purge_after)
+            self.assertIsNone(user.suspended_by_report_id)
+
+            post = Post.query.get(post_id)
+            self.assertIsNotNone(post)
+            self.assertFalse(post.is_hidden)
+            self.assertIsNone(post.purge_after)
+            self.assertIsNone(post.hidden_by_report_id)
+
+            banned_device = BannedDevice.query.filter_by(
+                device_id="android-rollback-report-1"
+            ).first()
+            self.assertIsNone(banned_device)
 
     def test_report_cleanup_hard_deletes_after_retention_window(self):
         self._register("alice")

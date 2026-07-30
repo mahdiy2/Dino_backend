@@ -479,6 +479,35 @@ def admin_handle_report(report_id):
     ), 200
 
 
+@admin_bp.route("/api/reports/<int:report_id>/rollback", methods=["POST"])
+@admin_required
+def admin_rollback_report_decision(report_id):
+    admin_username = get_jwt_identity()
+
+    try:
+        rollback_result = report_service.rollback_report_decision(
+            report_id=report_id,
+            admin_username=admin_username,
+        )
+        report_payload = report_service.get_report_detail_for_admin(report_id)
+    except ValueError as e:
+        message = str(e)
+        if message == "Report not found":
+            return jsonify({"error": message}), 404
+        if message in {"Post is not eligible for rollback", "User is not eligible for rollback"}:
+            return jsonify({"error": message}), 409
+        return jsonify({"error": message}), 400
+
+    return jsonify(
+        {
+            "message": "Rollback completed",
+            "report": report_payload,
+            "restored_posts": rollback_result["restored_posts"],
+            "restored_users": rollback_result["restored_users"],
+        }
+    ), 200
+
+
 # ── Post detail + comments ──────────────────────────────────────────
 
 @admin_bp.route("/api/posts/<int:post_id>", methods=["GET"])

@@ -7,6 +7,7 @@ from flask import current_app, has_app_context
 from app.config import Config
 from app.db import db
 from app.models.admin_model import AdminUser
+from app.models.banned_device_model import BannedDevice
 from app.models.comment_model import Comment
 from app.models.follow_model import Follow
 from app.models.media_model import Media
@@ -222,6 +223,7 @@ def _serialize_report(
     report: PostReport,
     user_by_id: dict[int, User],
     post_by_id: dict[int, Post],
+    rollback_available: bool = False,
 ):
     reporter = user_by_id.get(report.reporter_id)
     admin = user_by_id.get(report.handled_by_admin_id)
@@ -246,6 +248,7 @@ def _serialize_report(
         ),
         "created_at": report.created_at.isoformat() if report.created_at else None,
         "updated_at": report.updated_at.isoformat() if report.updated_at else None,
+        "rollback_available": bool(rollback_available),
     }
 
 
@@ -297,12 +300,19 @@ def list_reports_for_admin(
     )
 
     user_by_id, post_by_id = _build_maps_for_reports(reports)
+    rollback_map = _build_rollback_availability_map(reports)
     return {
         "page": page,
         "limit": limit,
         "total": total,
         "reports": [
-            _serialize_report(report, user_by_id, post_by_id) for report in reports
+            _serialize_report(
+                report,
+                user_by_id,
+                post_by_id,
+                rollback_available=rollback_map.get(report.id, False),
+            )
+            for report in reports
         ],
     }
 
@@ -313,7 +323,60 @@ def get_report_detail_for_admin(report_id: int):
         raise ValueError("Report not found")
 
     user_by_id, post_by_id = _build_maps_for_reports([report])
-    return _serialize_report(report, user_by_id, post_by_id)
+    rollback_map = _build_rollback_availability_map([report])
+    return _serialize_report(
+        report,
+        user_by_id,
+        post_by_id,
+        rollback_available=rollback_map.get(report.id, False),
+    )
+
+
+def _build_rollback_availability_map(reports: list[PostReport]) -> dict[int, bool]:
+    if not reports:
+        return {}
+
+    map_by_report_id = {report.id: False for report in reports}
+    delete_post_report_ids = {
+        report.id
+        for report in reports
+        if report.status == REPORT_STATUS_HANDLED
+        and report.admin_decision == ADMIN_DECISION_DELETE_POST
+    }
+    delete_account_report_ids = {
+        report.id
+        for report in reports
+        if report.status == REPORT_STATUS_HANDLED
+        and report.admin_decision == ADMIN_DECISION_DELETE_ACCOUNT
+    }
+
+    if delete_post_report_ids:
+        rows = (
+            Post.query
+            .filter(
+                Post.hidden_by_report_id.in_(delete_post_report_ids),
+                Post.is_hidden.is_(True),
+            )
+            .with_entities(Post.hidden_by_report_id)
+            .all()
+        )
+        for (report_id,) in rows:
+            map_by_report_id[int(report_id)] = True
+
+    if delete_account_report_ids:
+        rows = (
+            User.query
+            .filter(
+                User.suspended_by_report_id.in_(delete_account_report_ids),
+                User.is_suspended.is_(True),
+            )
+            .with_entities(User.suspended_by_report_id)
+            .all()
+        )
+        for (report_id,) in rows:
+            map_by_report_id[int(report_id)] = True
+
+    return map_by_report_id
 
 
 def _soft_delete_post(
@@ -427,6 +490,100 @@ def handle_report_by_admin(
 
     db.session.commit()
     return report
+
+
+def _restore_soft_deleted_post(post: Post):
+    post.is_hidden = False
+    post.hidden_at = None
+    post.hidden_reason = None
+    post.hidden_by_report_id = None
+    post.purge_after = None
+
+
+def _restore_soft_deleted_user(user: User):
+    user.is_suspended = False
+    user.suspended_at = None
+    user.suspension_reason = None
+    user.suspended_by_report_id = None
+    user.purge_after = None
+
+
+def rollback_report_decision(
+    report_id: int,
+    admin_username: str,
+):
+    admin_user = User.query.filter_by(username=admin_username).first()
+    if not admin_user or not _is_admin(admin_user.id):
+        raise ValueError("Admin not found")
+
+    report = report_repository.get_by_id(report_id)
+    if not report:
+        raise ValueError("Report not found")
+    if report.status != REPORT_STATUS_HANDLED:
+        raise ValueError("Report is still pending")
+    if report.admin_decision not in (
+        ADMIN_DECISION_DELETE_POST,
+        ADMIN_DECISION_DELETE_ACCOUNT,
+    ):
+        raise ValueError("Only delete decisions can be rolled back")
+
+    restored_posts = 0
+    restored_users = 0
+
+    if report.admin_decision == ADMIN_DECISION_DELETE_POST:
+        post = (
+            Post.query
+            .filter_by(
+                id=report.post_id,
+                hidden_by_report_id=report.id,
+                is_hidden=True,
+            )
+            .first()
+        )
+        if not post:
+            raise ValueError("Post is not eligible for rollback")
+        _restore_soft_deleted_post(post)
+        restored_posts = 1
+
+    else:
+        user = (
+            User.query
+            .filter_by(
+                suspended_by_report_id=report.id,
+                is_suspended=True,
+            )
+            .first()
+        )
+        if not user:
+            raise ValueError("User is not eligible for rollback")
+
+        _restore_soft_deleted_user(user)
+        restored_users = 1
+
+        posts = (
+            Post.query
+            .filter_by(
+                author_id=user.id,
+                hidden_by_report_id=report.id,
+                is_hidden=True,
+            )
+            .all()
+        )
+        for post in posts:
+            _restore_soft_deleted_post(post)
+            restored_posts += 1
+
+        BannedDevice.query.filter_by(
+            blocked_user_id=user.id,
+            blocked_by_report_id=report.id,
+        ).delete(synchronize_session=False)
+
+    db.session.commit()
+    return {
+        "report": report,
+        "restored_posts": restored_posts,
+        "restored_users": restored_users,
+    }
 
 
 def _hard_delete_post(post: Post):
