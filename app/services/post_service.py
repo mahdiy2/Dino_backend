@@ -1,4 +1,6 @@
+from app.services.media_submission_replay import finish_mutation
 import os
+import tempfile
 import uuid
 import time
 import mimetypes
@@ -806,9 +808,8 @@ def _get_stream_and_length(file_storage):
         return stream, -1
 
 
-def _store_media_locally(file_storage, post_id: int, extension: str) -> str:
-    filename = f"{uuid.uuid4()}.{extension}"
-    relative_parts = ["uploads", "posts", str(post_id), filename]
+def _store_media_locally(file_storage, directory: str, filename: str) -> str:
+    relative_parts = ["uploads", "posts", directory, filename]
     relative_path = os.path.join(*relative_parts)
     absolute_path = os.path.join(current_app.static_folder, relative_path)
     os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
@@ -818,7 +819,15 @@ def _store_media_locally(file_storage, post_id: int, extension: str) -> str:
     except Exception:
         pass
 
-    file_storage.save(absolute_path)
+    with tempfile.NamedTemporaryFile(dir=os.path.dirname(absolute_path), delete=False) as destination:
+        temporary_path = destination.name
+        try:
+            file_storage.save(destination)
+            destination.close()
+            os.replace(temporary_path, absolute_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
     return "static/" + "/".join(relative_parts)
 
 
@@ -963,7 +972,7 @@ def _prepare_validated_media_files(
     return validated_files
 
 
-def _store_validated_media_files_for_post(post_id: int, validated_files):
+def _store_validated_media_files_for_post(post_id: int, validated_files, submission=None):
     if not validated_files:
         return []
 
@@ -986,12 +995,14 @@ def _store_validated_media_files_for_post(post_id: int, validated_files):
             raise MediaStorageError("Media storage is unavailable") from e
         use_local_storage = True
 
-    for file, mimetype, extension, display_name, title, artist in validated_files:
+    directory = str(submission.storage_id) if submission else str(post_id)
+    for index, (file, mimetype, extension, display_name, title, artist) in enumerate(validated_files):
+        filename = f"{index if submission else uuid.uuid4()}.{extension}"
         object_name = None
 
         if not use_local_storage:
             try:
-                object_name = f"posts/{post_id}/{uuid.uuid4()}.{extension}"
+                object_name = f"posts/{directory}/{filename}"
                 stream, length = _get_stream_and_length(file)
                 upload_kwargs = {
                     "bucket_name": bucket,
@@ -1012,7 +1023,7 @@ def _store_validated_media_files_for_post(post_id: int, validated_files):
 
         if use_local_storage:
             try:
-                object_name = _store_media_locally(file, post_id, extension)
+                object_name = _store_media_locally(file, directory, filename)
             except Exception as e:
                 db.session.rollback()
                 raise MediaStorageError("Media storage is unavailable") from e
@@ -1044,6 +1055,7 @@ def create_post_with_media(
     track_artist: str | None = None,
     quoted_post_id: int | None = None,
     idempotency_key: str | None = None,
+    submission=None,
 ):
     normalized_idempotency_key = _normalize_post_idempotency_key(idempotency_key)
     idempotency_lock_handle = None
@@ -1157,81 +1169,19 @@ def create_post_with_media(
             quoted_post_id=(quoted_post.id if quoted_post is not None else None),
         )
 
-        media_post_process_items = []
-        if validated_files:
-            minio = None
-            bucket = current_app.config["MINIO_BUCKET"]
-            local_fallback_enabled = bool(
-                current_app.config.get("MEDIA_LOCAL_FALLBACK_ENABLED", True)
-            )
-            use_local_storage = False
+        media_post_process_items = _store_validated_media_files_for_post(post.id, validated_files, submission)
 
-            try:
-                minio = get_minio_client()
-                bucket_exists = minio.bucket_exists(bucket)
-                if not bucket_exists:
-                    minio.make_bucket(bucket)
-            except Exception as e:
-                if not local_fallback_enabled:
-                    db.session.rollback()
-                    raise MediaStorageError("Media storage is unavailable") from e
-                use_local_storage = True
-
-            for file, mimetype, extension, display_name, title, artist in validated_files:
-                object_name = None
-
-                if not use_local_storage:
-                    try:
-                        object_name = f"posts/{post.id}/{uuid.uuid4()}.{extension}"
-                        stream, length = _get_stream_and_length(file)
-                        upload_kwargs = {
-                            "bucket_name": bucket,
-                            "object_name": object_name,
-                            "data": stream,
-                            "length": length,
-                            "content_type": mimetype,
-                        }
-                        if length == -1:
-                            upload_kwargs["part_size"] = 10 * 1024 * 1024
-
-                        minio.put_object(**upload_kwargs)
-                    except Exception as e:
-                        if not local_fallback_enabled:
-                            db.session.rollback()
-                            raise MediaStorageError("Media storage is unavailable") from e
-                        use_local_storage = True
-
-                if use_local_storage:
-                    try:
-                        object_name = _store_media_locally(file, post.id, extension)
-                    except Exception as e:
-                        db.session.rollback()
-                        raise MediaStorageError("Media storage is unavailable") from e
-
-                add_media(
+        def after_commit():
+            if normalized_idempotency_key:
+                _store_idempotent_post_id(username, normalized_idempotency_key, post.id)
+            if media_post_process_items:
+                async_task_service.enqueue_media_post_process_task(
                     post_id=post.id,
-                    object_name=object_name,
-                    mime_type=mimetype,
-                    display_name=display_name,
-                    title=title,
-                    artist=artist,
-                )
-                media_post_process_items.append(
-                    {
-                        "object_name": object_name,
-                        "mime_type": mimetype,
-                    }
+                    media_items=media_post_process_items,
+                    source="post_service.create_post_with_media",
                 )
 
-        db.session.commit()
-        if normalized_idempotency_key:
-            _store_idempotent_post_id(username, normalized_idempotency_key, post.id)
-        if media_post_process_items:
-            async_task_service.enqueue_media_post_process_task(
-                post_id=post.id,
-                media_items=media_post_process_items,
-                source="post_service.create_post_with_media",
-            )
+        finish_mutation(submission, after_commit)
         return {"post_id": post.id}
     finally:
         _release_post_idempotency_lock(idempotency_lock_handle)
@@ -2063,6 +2013,7 @@ def edit_post_by_username(
     followers_only: bool | None = None,
     track_title: str | None = None,
     track_artist: str | None = None,
+    submission=None,
 ):
     user = user_repository.get_by_username(username)
     if not user or getattr(user, "is_suspended", False):
@@ -2141,25 +2092,26 @@ def edit_post_by_username(
                 synchronize_session=False
             )
 
-        media_post_process_items = _store_validated_media_files_for_post(post.id, validated_files)
-        db.session.commit()
+        media_post_process_items = _store_validated_media_files_for_post(post.id, validated_files, submission)
     except Exception:
         db.session.rollback()
         raise
 
-    for object_name in media_object_names_to_remove:
-        try:
-            _delete_media_object(object_name)
-        except Exception:
-            pass
+    def after_commit():
+        for object_name in media_object_names_to_remove:
+            try:
+                _delete_media_object(object_name)
+            except Exception:
+                pass
 
-    if media_post_process_items:
-        async_task_service.enqueue_media_post_process_task(
-            post_id=post.id,
-            media_items=media_post_process_items,
-            source="post_service.edit_post_by_username",
-        )
+        if media_post_process_items:
+            async_task_service.enqueue_media_post_process_task(
+                post_id=post.id,
+                media_items=media_post_process_items,
+                source="post_service.edit_post_by_username",
+            )
 
+    finish_mutation(submission, after_commit)
     return post
 
 

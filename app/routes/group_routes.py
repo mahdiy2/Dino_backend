@@ -10,6 +10,7 @@ from app.services.group_service import (
     PublicRoomOperationError,
 )
 from app.services import message_service
+from app.services.media_submission_replay import run_media_submission
 from app.socket_events import (
     emit_group_event_to_members,
     evict_user_from_group_room,
@@ -319,18 +320,22 @@ def upload_group_attachment(group_id):
 
     file = request.files.get("file") or request.files.get("attachment")
 
-    try:
-        payload = message_service.upload_message_attachment(
-            username=username,
-            file_storage=file,
-            upload_scope="group",
-        )
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    except message_service.MessageAttachmentStorageError as exc:
-        return jsonify({"error": str(exc)}), 503
+    def execute(submission):
+        try:
+            payload = message_service.upload_message_attachment(
+                username=username,
+                file_storage=file,
+                storage_id=submission.storage_id if submission else None,
+                upload_scope="group",
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except message_service.MessageAttachmentStorageError as exc:
+            return jsonify({"error": str(exc)}), 503
 
-    return jsonify({"attachment": payload}), 201
+        return jsonify({"attachment": payload}), 201
+
+    return run_media_submission(username, f"group-attachment:{group_id}", execute)
 
 
 @group_bp.route("/mutual-followers", methods=["GET"])

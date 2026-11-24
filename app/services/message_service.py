@@ -147,8 +147,8 @@ def _ensure_stream_has_known_length(stream, size_bytes: int, max_size: int, atta
     return temp_stream, total_size, True
 
 
-def _store_locally(stream, username: str, extension: str) -> str:
-    filename = f"{uuid.uuid4()}.{extension}"
+def _store_locally(stream, username: str, extension: str, storage_id=None) -> str:
+    filename = f"{storage_id or uuid.uuid4()}.{extension}"
     relative_parts = ["uploads", "messages", username, filename]
     relative_path = os.path.join(*relative_parts)
     absolute_path = os.path.join(current_app.static_folder, relative_path)
@@ -157,12 +157,16 @@ def _store_locally(stream, username: str, extension: str) -> str:
     if not _rewind_stream(stream):
         raise MessageAttachmentStorageError("Unable to rewind media stream for local storage")
 
-    with open(absolute_path, "wb") as destination:
-        while True:
-            chunk = stream.read(STREAM_COPY_CHUNK_SIZE)
-            if not chunk:
-                break
-            destination.write(chunk)
+    with tempfile.NamedTemporaryFile(dir=os.path.dirname(absolute_path), delete=False) as destination:
+        temporary_path = destination.name
+        try:
+            while chunk := stream.read(STREAM_COPY_CHUNK_SIZE):
+                destination.write(chunk)
+            destination.close()
+            os.replace(temporary_path, absolute_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
     return "static/" + "/".join(relative_parts)
 
 
@@ -221,7 +225,7 @@ def _log_attachment_upload(
     )
 
 
-def upload_message_attachment(username: str, file_storage, upload_scope: str = "private"):
+def upload_message_attachment(username: str, file_storage, upload_scope: str = "private", *, storage_id=None):
     started_at = time.perf_counter()
 
     def elapsed_ms() -> int:
@@ -366,7 +370,7 @@ def upload_message_attachment(username: str, file_storage, upload_scope: str = "
             try:
                 if not _rewind_stream(stream):
                     raise MessageAttachmentStorageError("Unable to rewind media stream for upload")
-                object_name = f"messages/{username}/{uuid.uuid4()}.{extension}"
+                object_name = f"messages/{username}/{storage_id or uuid.uuid4()}.{extension}"
                 minio.put_object(
                     bucket_name=bucket,
                     object_name=object_name,
@@ -391,7 +395,7 @@ def upload_message_attachment(username: str, file_storage, upload_scope: str = "
 
         if use_local_storage:
             try:
-                object_name = _store_locally(stream, username, extension)
+                object_name = _store_locally(stream, username, extension, storage_id)
             except Exception as exc:
                 _log_attachment_upload(
                     level="error",

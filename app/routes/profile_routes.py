@@ -1,4 +1,5 @@
 from flask import Blueprint, jsonify, request
+from app.services.media_submission_replay import run_media_submission
 from flask_jwt_extended import get_jwt_identity, jwt_required
 
 from app.services import profile_service
@@ -86,20 +87,24 @@ def update_my_profile():
         remove_profile_image = _parse_truthy_flag(data.get("remove_profile_image"))
         remove_profile_video = _parse_truthy_flag(data.get("remove_profile_video"))
 
-    try:
-        profile = profile_service.update_profile(
-            username=username,
-            name=name,
-            bio=bio,
-            profile_image_shape=profile_image_shape,
-            profile_image=profile_image,
-            profile_video=profile_video,
-            remove_profile_image=remove_profile_image,
-            remove_profile_video=remove_profile_video,
-        )
-        return jsonify(profile), 200
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+    def execute(submission):
+        try:
+            profile = profile_service.update_profile(
+                username=username,
+                name=name,
+                bio=bio,
+                profile_image_shape=profile_image_shape,
+                profile_image=profile_image,
+                profile_video=profile_video,
+                remove_profile_image=remove_profile_image,
+                remove_profile_video=remove_profile_video,
+                submission=submission,
+            )
+            return jsonify(profile), 200
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
+    return run_media_submission(username, "profile-update", execute)
 
 
 @profile_bp.route("/profiles/me", methods=["DELETE"])

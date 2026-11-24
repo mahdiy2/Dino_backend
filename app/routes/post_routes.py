@@ -1,4 +1,5 @@
 from flask import Blueprint, request, jsonify
+from app.services.media_submission_replay import run_media_submission
 from flask_jwt_extended import get_jwt_identity, jwt_required
 from app.services.post_service import (
     ConcurrentPostUploadError,
@@ -220,29 +221,33 @@ def create_post():
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
 
-    try:
-        result = create_post_with_media(
-            username,
-            text,
-            files,
-            followers_only=followers_only,
-            track_title=track_title,
-            track_artist=track_artist,
-            quoted_post_id=quoted_post_id,
-            idempotency_key=idempotency_key,
-        )
-        return jsonify({
-            "message": "Post created successfully",
-            "post_id": result["post_id"]
-        }), 201
-    except MediaStorageError as e:
-        return jsonify({"error": str(e)}), 503
-    except ConcurrentPostUploadError as e:
-        return jsonify({"error": str(e)}), 409
-    except ValueError as e:
-        if str(e) == "Account suspended":
-            return jsonify({"error": str(e)}), 403
-        return jsonify({"error": str(e)}), 400
+    def execute(submission):
+        try:
+            result = create_post_with_media(
+                username,
+                text,
+                files,
+                followers_only=followers_only,
+                track_title=track_title,
+                track_artist=track_artist,
+                submission=submission,
+                quoted_post_id=quoted_post_id,
+                idempotency_key=idempotency_key if submission is None else None,
+            )
+            return jsonify({
+                "message": "Post created successfully",
+                "post_id": result["post_id"]
+            }), 201
+        except MediaStorageError as e:
+            return jsonify({"error": str(e)}), 503
+        except ConcurrentPostUploadError as e:
+            return jsonify({"error": str(e)}), 409
+        except ValueError as e:
+            if str(e) == "Account suspended":
+                return jsonify({"error": str(e)}), 403
+            return jsonify({"error": str(e)}), 400
+
+    return run_media_submission(username, "post-create", execute, require_version=True)
 
 
 
@@ -380,26 +385,30 @@ def edit_post(post_id):
             except ValueError as e:
                 return jsonify({"error": str(e)}), 400
 
-    try:
-        edit_post_by_username(
-            post_id=post_id,
-            username=username,
-            text=text,
-            files=files,
-            keep_media_ids=keep_media_ids,
-            followers_only=followers_only,
-            track_title=track_title,
-            track_artist=track_artist,
-        )
-        return jsonify({"message": "Post updated", "post_id": post_id}), 200
-    except MediaStorageError as e:
-        return jsonify({"error": str(e)}), 503
-    except PermissionError as e:
-        return jsonify({"error": str(e)}), 403
-    except ValueError as e:
-        message = str(e)
-        if message == "Account suspended":
-            return jsonify({"error": message}), 403
-        if message in {"Post not found", "User not found"}:
-            return jsonify({"error": message}), 404
-        return jsonify({"error": message}), 400
+    def execute(submission):
+        try:
+            edit_post_by_username(
+                post_id=post_id,
+                username=username,
+                text=text,
+                files=files,
+                keep_media_ids=keep_media_ids,
+                followers_only=followers_only,
+                track_title=track_title,
+                track_artist=track_artist,
+                submission=submission,
+            )
+            return jsonify({"message": "Post updated", "post_id": post_id}), 200
+        except MediaStorageError as e:
+            return jsonify({"error": str(e)}), 503
+        except PermissionError as e:
+            return jsonify({"error": str(e)}), 403
+        except ValueError as e:
+            message = str(e)
+            if message == "Account suspended":
+                return jsonify({"error": message}), 403
+            if message in {"Post not found", "User not found"}:
+                return jsonify({"error": message}), 404
+            return jsonify({"error": message}), 400
+
+    return run_media_submission(username, f"post-edit:{post_id}", execute)

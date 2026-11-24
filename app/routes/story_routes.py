@@ -1,4 +1,5 @@
 from flask import Blueprint, jsonify, request
+from app.services.media_submission_replay import run_media_submission
 from flask_jwt_extended import get_jwt_identity, jwt_required
 
 from app.services import message_service
@@ -63,19 +64,23 @@ def upload_story_route():
     else:
         return jsonify({"error": "Use multipart/form-data with file"}), 400
 
-    try:
-        payload = upload_story(
-            username=username,
-            file_storage=file,
-            mention_usernames=mention_usernames,
-        )
-        return jsonify(payload), 201
-    except ValueError as exc:
-        if str(exc) == "Account suspended":
-            return jsonify({"error": str(exc)}), 403
-        return jsonify({"error": str(exc)}), 400
-    except message_service.MessageAttachmentStorageError as exc:
-        return jsonify({"error": str(exc)}), 503
+    def execute(submission):
+        try:
+            payload = upload_story(
+                username=username,
+                file_storage=file,
+                mention_usernames=mention_usernames,
+                submission=submission,
+            )
+            return jsonify(payload), 201
+        except ValueError as exc:
+            if str(exc) == "Account suspended":
+                return jsonify({"error": str(exc)}), 403
+            return jsonify({"error": str(exc)}), 400
+        except message_service.MessageAttachmentStorageError as exc:
+            return jsonify({"error": str(exc)}), 503
+
+    return run_media_submission(username, "story-create", execute)
 
 
 @story_bp.route("/story/feed", methods=["GET"])

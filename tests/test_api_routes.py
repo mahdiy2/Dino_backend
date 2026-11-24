@@ -5348,6 +5348,84 @@ class TestApiRoutes(unittest.TestCase):
             self.assertEqual(CrashLog.query.count(), 0)
 
 
+    def test_media_submission_replay_across_upload_routes(self):
+        self._register("alice")
+        headers = self._auth_header("alice")
+        self.assertEqual(
+            self.client.get("/api/messages/media-submission-capabilities").json,
+            {"replay_version": 1},
+        )
+
+        class Storage:
+            def __init__(self):
+                self.uploads = []
+
+            def bucket_exists(self, *_):
+                return True
+
+            def put_object(self, **kwargs):
+                self.uploads.append(kwargs["object_name"])
+
+            def remove_object(self, **kwargs):
+                pass
+
+        storage = Storage()
+        def submit(method, path, key, fields):
+            return self.client.open(
+                path, method=method,
+                headers={**headers, "Idempotency-Key": key, "X-Dino-Media-Replay": "1"},
+                data=fields(),
+                content_type="multipart/form-data",
+            )
+
+        def photo(data=b"image"):
+            return (io.BytesIO(data), "test.webp", "image/webp")
+
+        def assert_replay(method, path, key, fields, *, expected=201):
+            count = len(storage.uploads)
+            first = submit(method, path, key, fields)
+            self.assertEqual(first.status_code, expected, first.get_json())
+            self.assertEqual(first.headers.get("X-Dino-Media-Replay"), "1")
+            self.assertEqual(len(storage.uploads), count + 1)
+            replay = submit(method, path, key, fields)
+            self.assertEqual((replay.status_code, replay.json), (expected, first.json))
+            self.assertEqual(len(storage.uploads), count + 1)
+            return first.json
+
+        with (
+            patch("app.services.message_service.get_minio_client", return_value=storage),
+            patch("app.services.profile_service.get_minio_client", return_value=storage),
+            patch("app.services.post_service.get_minio_client", return_value=storage),
+        ):
+            assert_replay("POST", "/api/messages/attachments", "private", lambda: {"file": photo()})
+            mismatch = submit(
+                "POST", "/api/messages/attachments", "private", lambda: {"file": photo(b"different")}
+            )
+            self.assertEqual(mismatch.status_code, 409)
+
+            group_response = self.client.post("/api/groups", headers=headers, json={"name": "Replay test"})
+            self.assertEqual(group_response.status_code, 201, group_response.json)
+            group_id = group_response.json["group"]["id"]
+            assert_replay("POST", f"/api/groups/{group_id}/attachments", "group", lambda: {"file": photo()})
+
+            assert_replay(
+                "PUT", "/api/profiles/me", "profile", lambda: {"profile_image": photo()}, expected=200,
+            )
+            post = assert_replay("POST", "/api/posts", "post", lambda: {"text": "Photo", "media[]": photo()})
+            assert_replay(
+                "PUT", f"/api/posts/{post['post_id']}", "edit",
+                lambda: {"text": "New photo", "media[]": photo()}, expected=200,
+            )
+            assert_replay(
+                "POST", "/api/posts", "music",
+                lambda: {
+                    "text": "",
+                    "track_title": "Example",
+                    "media[]": (io.BytesIO(b"ID3" + bytes(128)), "track.mp3", "audio/mpeg"),
+                },
+            )
+            assert_replay("POST", "/api/story/upload", "story", lambda: {"file": photo()})
+
     def test_message_attachment_upload_success(self):
         self._register("alice")
         headers = self._auth_header("alice")

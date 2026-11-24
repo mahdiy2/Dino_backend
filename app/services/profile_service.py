@@ -1,3 +1,4 @@
+from app.services.media_submission_replay import finish_mutation
 import os
 import uuid
 
@@ -146,13 +147,16 @@ def _delete_media_object(object_name: str | None):
         raise
 
 
-def _get_or_create_profile(user):
+def _get_or_create_profile(user, *, commit=True):
     profile = get_by_user_id(user.id)
     if profile:
         return profile
 
     profile = create_profile_for_user(user.id, user.username)
-    db.session.commit()
+    if commit:
+        db.session.commit()
+    else:
+        db.session.flush()
     return profile
 
 
@@ -247,12 +251,13 @@ def update_profile(
     profile_video=None,
     remove_profile_image: bool = False,
     remove_profile_video: bool = False,
+    submission=None,
 ):
     user = user_repository.get_by_username(username)
     if not user or getattr(user, "is_suspended", False):
         raise ValueError("User not found")
 
-    profile = _get_or_create_profile(user)
+    profile = _get_or_create_profile(user, commit=submission is None)
 
     if (
         name is None
@@ -333,7 +338,7 @@ def update_profile(
             minio = get_minio_client()
 
         extension = _extension_for_mimetype(image_mimetype)
-        object_name = f"profiles/{user.id}/images/{uuid.uuid4()}.{extension}"
+        object_name = f"profiles/{user.id}/images/{submission.storage_id if submission else uuid.uuid4()}.{extension}"
         stream, length = _get_stream_and_length(profile_image)
 
         upload_kwargs = {
@@ -392,7 +397,7 @@ def update_profile(
                 )
 
         extension = _extension_for_mimetype(mimetype)
-        object_name = f"profiles/{user.id}/videos/{uuid.uuid4()}.{extension}"
+        object_name = f"profiles/{user.id}/videos/{submission.storage_id if submission else uuid.uuid4()}.{extension}"
         stream, length = _get_stream_and_length(profile_video)
 
         if length == -1:
@@ -422,24 +427,24 @@ def update_profile(
             video_object_name=object_name,
         )
 
-    db.session.commit()
+    def cleanup():
+        if old_image_object_name and old_image_object_name != profile.image_object_name:
+            try:
+                _delete_media_object(old_image_object_name)
+            except Exception:
+                pass
 
-    if old_image_object_name and old_image_object_name != profile.image_object_name:
-        try:
-            _delete_media_object(old_image_object_name)
-        except Exception:
-            pass
+        current_profile_video = profile_video_repository.get_by_user_id(user.id)
+        current_video_object_name = (
+            current_profile_video.video_object_name if current_profile_video else None
+        )
+        if old_video_object_name and old_video_object_name != current_video_object_name:
+            try:
+                _delete_media_object(old_video_object_name)
+            except Exception:
+                pass
 
-    current_profile_video = profile_video_repository.get_by_user_id(user.id)
-    current_video_object_name = (
-        current_profile_video.video_object_name if current_profile_video else None
-    )
-    if old_video_object_name and old_video_object_name != current_video_object_name:
-        try:
-            _delete_media_object(old_video_object_name)
-        except Exception:
-            pass
-
+    finish_mutation(submission, cleanup)
     return _serialize_profile(user, profile)
 
 

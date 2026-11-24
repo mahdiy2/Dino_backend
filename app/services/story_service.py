@@ -1,3 +1,4 @@
+from app.services.media_submission_replay import finish_mutation
 import json
 import os
 import time
@@ -551,7 +552,7 @@ def flush_story_view_queue(*, batch_size: int | None = None):
     return processed
 
 
-def upload_story(*, username: str, file_storage, mention_usernames=None):
+def upload_story(*, username: str, file_storage, mention_usernames=None, submission=None):
     user = user_repository.get_by_username(username)
     if not user:
         raise ValueError("User not found")
@@ -589,6 +590,7 @@ def upload_story(*, username: str, file_storage, mention_usernames=None):
             username=username,
             file_storage=file_storage,
             upload_scope="story",
+            storage_id=submission.storage_id if submission else None,
         )
         media_type = (attachment_payload.get("type") or "").strip().lower()
         if media_type not in STORY_MEDIA_TYPES:
@@ -608,8 +610,9 @@ def upload_story(*, username: str, file_storage, mention_usernames=None):
             mention_user_ids=allowed_mention_ids,
             auto_commit=False,
         )
-        db.session.commit()
     except Exception:
+        if submission is not None:
+            raise
         db.session.rollback()
         try:
             release_daily_story_slot(
@@ -621,26 +624,29 @@ def upload_story(*, username: str, file_storage, mention_usernames=None):
             db.session.rollback()
         raise
 
-    cache_users = _fetch_follower_user_ids(user.id)
-    cache_users.add(user.id)
-    _invalidate_story_feed_cache_for_user_ids(cache_users)
+    def deliver_mentions():
+        cache_users = _fetch_follower_user_ids(user.id)
+        cache_users.add(user.id)
+        _invalidate_story_feed_cache_for_user_ids(cache_users)
 
-    if allowed_mention_ids:
-        recipients = User.query.filter(User.id.in_(allowed_mention_ids)).all()
-        for recipient in recipients:
-            try:
-                _send_story_mention_dm(sender=user, recipient=recipient, story=story)
-                activity_notification_service.notify_story_mention(
-                    actor_username=username,
-                    target_username=recipient.username,
-                    story_id=story.id,
-                )
-            except Exception:
-                current_app.logger.exception(
-                    "Failed to deliver story mention side effect story_id=%s recipient=%s",
-                    story.id,
-                    recipient.username,
-                )
+        if allowed_mention_ids:
+            recipients = User.query.filter(User.id.in_(allowed_mention_ids)).all()
+            for recipient in recipients:
+                try:
+                    _send_story_mention_dm(sender=user, recipient=recipient, story=story)
+                    activity_notification_service.notify_story_mention(
+                        actor_username=username,
+                        target_username=recipient.username,
+                        story_id=story.id,
+                    )
+                except Exception:
+                    current_app.logger.exception(
+                        "Failed to deliver story mention side effect story_id=%s recipient=%s",
+                        story.id,
+                        recipient.username,
+                    )
+
+    finish_mutation(submission, deliver_mentions)
 
     return {
         "story_id": story.id,

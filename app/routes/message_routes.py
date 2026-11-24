@@ -1,6 +1,7 @@
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app.services import message_service
+from app.services.media_submission_replay import run_media_submission
 
 message_bp = Blueprint("messages", __name__)
 
@@ -13,24 +14,33 @@ def send():
     }), 410
 
 
+@message_bp.route("/media-submission-capabilities", methods=["GET"])
+def media_submission_capabilities():
+    return jsonify({"replay_version": 1})
+
+
 @message_bp.route("/attachments", methods=["POST"])
 @jwt_required()
 def upload_attachment():
     username = get_jwt_identity()
     file = request.files.get("file") or request.files.get("attachment")
 
-    try:
-        payload = message_service.upload_message_attachment(
-            username=username,
-            file_storage=file,
-            upload_scope="private",
-        )
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    except message_service.MessageAttachmentStorageError as exc:
-        return jsonify({"error": str(exc)}), 503
+    def execute(submission):
+        try:
+            payload = message_service.upload_message_attachment(
+                username=username,
+                file_storage=file,
+                storage_id=submission.storage_id if submission else None,
+                upload_scope="private",
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except message_service.MessageAttachmentStorageError as exc:
+            return jsonify({"error": str(exc)}), 503
 
-    return jsonify({"attachment": payload}), 201
+        return jsonify({"attachment": payload}), 201
+
+    return run_media_submission(username, "private-attachment", execute)
 
 
 @message_bp.route("/inbox", methods=["GET"])
