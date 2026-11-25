@@ -698,7 +698,7 @@ def rotate_public_key(username, public_key):
     }
 
 
-def get_key_status(username):
+def get_key_status(username, include_public_key=False):
     if not _require_non_empty_string(username):
         raise AuthError("Unauthorized", status_code=401)
 
@@ -709,9 +709,11 @@ def get_key_status(username):
     if getattr(user, "is_suspended", False):
         raise AuthError("Account suspended", status_code=403)
 
-    return {
-        "has_public_key": bool(getattr(user, "public_key", None)),
-    }
+    public_key = getattr(user, "public_key", None)
+    result = {"has_public_key": bool(public_key)}
+    if include_public_key:
+        result.update(username=user.username, public_key=public_key)
+    return result
 
 
 def update_user_device_id(username, device_id):

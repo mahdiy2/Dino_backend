@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
 from app.services import auth_service
-from app.routes.web_session import handle_web_session
+from app.routes.web_session import browser_identity, handle_web_session
 from app.extensions.extensions import socketio
 from app.socket_events import emit_group_event_to_members
 
@@ -122,10 +122,35 @@ def rotate_public_key():
 
     username = get_jwt_identity()
 
+    return _rotate_account_key(username, data.get("public_key"))
+
+
+@auth_bp.route("/web-session/keys", methods=["GET", "POST"])
+def browser_account_keys():
+    username, error = browser_identity(require_origin=request.method == "POST")
+    if error is not None:
+        return error
+
+    if request.method == "GET":
+        response = jsonify(auth_service.get_key_status(username, include_public_key=True))
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid JSON body"}), 400
+    try:
+        auth_service.authenticate_user_credentials(username, data.get("password"))
+    except ValueError as error:
+        return _auth_error_response(error, fallback_status_code=401)
+    return _rotate_account_key(username, data.get("public_key"))
+
+
+def _rotate_account_key(username, public_key):
     try:
         result = auth_service.rotate_public_key(
             username=username,
-            public_key=data.get("public_key"),
+            public_key=public_key,
         )
     except ValueError as e:
         return _auth_error_response(e)
@@ -156,7 +181,7 @@ def rotate_public_key():
 def get_key_status():
     username = get_jwt_identity()
     try:
-        status = auth_service.get_key_status(username=username)
+        status = auth_service.get_key_status(username=username, include_public_key=request.args.get("include_public_key") == "1")
     except ValueError as e:
         return _auth_error_response(e, fallback_status_code=401)
     return jsonify(status), 200

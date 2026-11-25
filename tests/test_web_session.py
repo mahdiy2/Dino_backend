@@ -7,7 +7,8 @@ from unittest.mock import patch
 from flask import Flask
 
 from app.db import db
-from app.routes.web_session import COOKIE_NAME, WebSession, handle_web_session
+from app.routes.auth_routes import auth_bp
+from app.routes.web_session import COOKIE_NAME, WebSession
 
 
 class WebSessionTest(unittest.TestCase):
@@ -18,7 +19,7 @@ class WebSessionTest(unittest.TestCase):
         app = Flask(__name__)
         app.config.update(SQLALCHEMY_DATABASE_URI="sqlite://")
         db.init_app(app)
-        app.add_url_rule(self.path, view_func=handle_web_session, methods=["GET", "POST", "DELETE"])
+        app.register_blueprint(auth_bp, url_prefix="/api/auth")
         self.context = app.app_context()
         self.context.push()
         self.addCleanup(self.context.pop)
@@ -62,3 +63,29 @@ class WebSessionTest(unittest.TestCase):
         WebSession.query.one().expires_at = int(time.time()) - 1
         db.session.commit()
         self.assertIsNone(self.client.get(self.path, base_url=self.origin).json["username"])
+
+
+    def test_account_keys_require_session_origin_and_password(self):
+        path = self.path + "/keys"
+        unauthenticated = self.client.get(path, base_url=self.origin)
+        self.assertEqual(unauthenticated.status_code, 401)
+        user = SimpleNamespace(username="mina", is_suspended=False)
+        with patch("app.routes.web_session.auth_service.authenticate_user_credentials", return_value=user):
+            self.assertEqual(self.sign_in().status_code, 200)
+        with patch("app.routes.web_session.user_repository.get_by_username", return_value=user), \
+                patch("app.routes.auth_routes.auth_service.get_key_status", return_value={"username": "mina", "public_key": "current"}), \
+                patch("app.routes.auth_routes.auth_service.rotate_public_key", return_value={"username": "mina", "group_ids": [], "notify_usernames": []}) as rotate, \
+                patch("app.routes.auth_routes.auth_service.authenticate_user_credentials") as authenticate:
+            read = self.client.get(path, base_url=self.origin)
+            self.assertEqual(read.json["public_key"], "current")
+            self.assertEqual(read.headers["Cache-Control"], "no-store")
+            rejected = self.client.post(path, base_url=self.origin, headers={"Origin": "https://other.example"}, json={})
+            self.assertEqual(rejected.status_code, 403)
+            authenticate.side_effect = ValueError("Invalid credentials")
+            rejected = self.client.post(path, base_url=self.origin, headers={"Origin": self.origin}, json={"password": "wrong"})
+            self.assertEqual(rejected.status_code, 401)
+            rotate.assert_not_called()
+            authenticate.side_effect = None
+            accepted = self.client.post(path, base_url=self.origin, headers={"Origin": self.origin}, json={"password": "fixture", "public_key": "replacement"})
+            self.assertEqual(accepted.status_code, 200)
+            rotate.assert_called_once_with(username="mina", public_key="replacement")

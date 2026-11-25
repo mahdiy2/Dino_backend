@@ -53,6 +53,22 @@ def _reply(payload, status=200):
     return response
 
 
+def browser_identity(require_origin=False):
+    settings = _settings()
+    if settings is None:
+        return None, _reply({"error": "Browser sessions are unavailable"}, 503)
+    origin, cookie_name, _ = settings
+    if require_origin and request.headers.get("Origin") != origin:
+        return None, _reply({"error": "Request origin rejected"}, 403)
+    token = request.cookies.get(cookie_name)
+    session = db.session.get(WebSession, _digest(token)) if token else None
+    if session and session.expires_at > int(time.time()):
+        user = user_repository.get_by_username(session.username)
+        if user and not getattr(user, "is_suspended", False):
+            return user.username, None
+    return None, _reply({"error": "Sign-in required"}, 401)
+
+
 def handle_web_session():
     settings = _settings()
     if settings is None:
