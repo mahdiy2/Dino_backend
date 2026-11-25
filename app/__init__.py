@@ -5,11 +5,11 @@ from datetime import datetime, timedelta
 
 from flask import Flask, jsonify
 from flask_jwt_extended import JWTManager
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 
 from app.extensions.extensions import ma, socketio
 
-from app.config import Config
+from app.config import Config, refresh_database_config
 from app.db import db
 from app.performance_indexes import ensure_performance_indexes
 from werkzeug.exceptions import HTTPException
@@ -62,6 +62,31 @@ _daily_winner_worker_started = False
 _daily_winner_worker_lock = threading.Lock()
 _story_cleanup_worker_started = False
 _story_cleanup_worker_lock = threading.Lock()
+_sqlite_pragma_engine_ids = set()
+
+
+def _configure_sqlite_pragmas(app: Flask):
+    engine = db.engine
+
+    if engine.dialect.name != "sqlite" or id(engine) in _sqlite_pragma_engine_ids:
+        return
+    _sqlite_pragma_engine_ids.add(id(engine))
+
+    busy_timeout_ms = max(
+        1000,
+        int(app.config.get("SQLITE_BUSY_TIMEOUT_MS", 30000) or 30000),
+    )
+
+    def _set_pragmas(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    event.listen(engine, "connect", _set_pragmas)
+    with engine.connect() as connection:
+        connection.exec_driver_sql(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
 
 
 def _ensure_post_visibility_schema():
@@ -160,6 +185,33 @@ def _ensure_post_daily_winner_schema():
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_posts_single_daily_winner "
             "ON posts (is_daily_winner) "
             "WHERE is_daily_winner = TRUE"
+        )
+    )
+
+    db.session.commit()
+
+
+def _ensure_post_edit_schema():
+    inspector = inspect(db.engine)
+    if not inspector.has_table("posts"):
+        return
+
+    column_names = {
+        column["name"]
+        for column in inspector.get_columns("posts")
+    }
+    if "edited_at" not in column_names:
+        db.session.execute(
+            text(
+                "ALTER TABLE posts "
+                "ADD COLUMN edited_at TIMESTAMP"
+            )
+        )
+
+    db.session.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_posts_edited_at "
+            "ON posts (edited_at)"
         )
     )
 
@@ -623,6 +675,27 @@ def _ensure_crash_log_schema():
     if not inspector.has_table("crash_logs"):
         return
 
+    db.session.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS crash_event_ids ("
+            "id INTEGER PRIMARY KEY, "
+            "event_id VARCHAR(64) NOT NULL UNIQUE, "
+            "crash_log_id INTEGER NOT NULL, "
+            "received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        )
+    )
+    db.session.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS resolved_crash_signatures ("
+            "id INTEGER PRIMARY KEY, "
+            "signature VARCHAR(64) NOT NULL UNIQUE, "
+            "resolved_by_admin_id INTEGER, "
+            "resolved_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        )
+    )
+
     column_names = {
         column["name"]
         for column in inspector.get_columns("crash_logs")
@@ -838,7 +911,7 @@ def _ensure_pending_registration_device_id_schema():
 
 
 def _warn_on_database_fallback(app: Flask):
-    if Config.DATABASE_URL_WAS_EXPLICIT:
+    if app.config.get("DATABASE_URL_WAS_EXPLICIT", False):
         return
     app.logger.warning(
         "DATABASE_URL is not set; using sqlite:///messenger.db. "
@@ -1061,6 +1134,7 @@ def create_app():
                 static_folder='static')
 
     app.config.from_object(Config)
+    refresh_database_config(app.config)
 
     app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB hard cap
     _warn_on_database_fallback(app)
@@ -1115,9 +1189,11 @@ def create_app():
     app.register_blueprint(group_bp, url_prefix="/api/groups")
 
     with app.app_context():
+        _configure_sqlite_pragmas(app)
         db.create_all()
         _ensure_post_visibility_schema()
         _ensure_post_quote_schema()
+        _ensure_post_edit_schema()
         _ensure_post_daily_winner_schema()
         _ensure_media_schema()
         _ensure_performance_indexes()

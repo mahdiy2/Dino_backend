@@ -106,6 +106,21 @@ def _resolve_socketio_cors_allowed_origins(default_origins, cors_origins):
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _is_sqlite_database_uri(uri: str) -> bool:
+    return uri.startswith("sqlite:")
+
+
+def _sqlite_engine_options(uri: str):
+    if not _is_sqlite_database_uri(uri):
+        return {}
+    return {
+        "connect_args": {
+            "check_same_thread": False,
+            "timeout": max(1, _env_int("SQLITE_BUSY_TIMEOUT_SECONDS", 30)),
+        },
+    }
+
+
 class Config:
     APP_ENV = _env_str(
         "APP_ENV",
@@ -116,6 +131,11 @@ class Config:
     SQLALCHEMY_DATABASE_URI = DATABASE_URL or "sqlite:///messenger.db"
     DATABASE_URL_WAS_EXPLICIT = bool(DATABASE_URL)
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    SQLALCHEMY_ENGINE_OPTIONS = _sqlite_engine_options(SQLALCHEMY_DATABASE_URI)
+    SQLITE_BUSY_TIMEOUT_MS = max(
+        1000,
+        _env_int("SQLITE_BUSY_TIMEOUT_MS", 30000),
+    )
 
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-secret")
     AUTH_PASSWORD_PEPPER = _env_str(
@@ -412,4 +432,16 @@ class Config:
     MODERATION_CLEANUP_BACKGROUND_ENABLED = _env_bool(
         "MODERATION_CLEANUP_BACKGROUND_ENABLED",
         MODERATION_CLEANUP_RUNNER == "inprocess",
+    )
+
+
+def refresh_database_config(app_config):
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    database_uri = database_url or "sqlite:///messenger.db"
+    app_config["SQLALCHEMY_DATABASE_URI"] = database_uri
+    app_config["DATABASE_URL_WAS_EXPLICIT"] = bool(database_url)
+    app_config["SQLALCHEMY_ENGINE_OPTIONS"] = _sqlite_engine_options(database_uri)
+    app_config["SQLITE_BUSY_TIMEOUT_MS"] = max(
+        1000,
+        _env_int("SQLITE_BUSY_TIMEOUT_MS", 30000),
     )
