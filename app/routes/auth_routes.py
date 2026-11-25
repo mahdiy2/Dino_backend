@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
 from app.services import auth_service
+from app.routes.web_session import handle_web_session
 from app.extensions.extensions import socketio
 from app.socket_events import emit_group_event_to_members
 
@@ -73,6 +74,11 @@ def register_confirm():
         return jsonify({"message": "User registered"}), 201
     except ValueError as e:
         return _auth_error_response(e)
+
+
+@auth_bp.route("/web-session", methods=["GET", "POST", "DELETE"])
+def web_session():
+    return handle_web_session()
 
 
 @auth_bp.route("/login", methods=["POST"])
